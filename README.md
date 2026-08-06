@@ -3,6 +3,48 @@
 "매수맛집" 콘텐츠에서 공유되는 경매 PDF를 텔레그램으로 받아 사건 단위로 분석하고,
 텔레그램 대표 메시지 + Notion DB("매수맛집 경매")로 자동 정리/추적하는 시스템입니다.
 
+## PDF 입력/출력 위치 (반드시 확인)
+
+실제 봇/채널 이름은 배포 환경마다 다를 수 있지만, 예시로는 다음과 같이 구성합니다.
+
+- **입력**: PDF는 반드시 입력봇(예: "자료드랍_경매") **개인 대화방(1:1 DM)** 으로 보내야 합니다.
+  - `TELEGRAM_AUCTION_BOT_TOKEN`이 이 입력봇의 토큰입니다.
+  - `TELEGRAM_ALLOWED_USER_ID`로 등록된 사용자가 보낸 PDF만 처리합니다.
+  - **출력 채널에 PDF를 직접 올리는 것이 아닙니다.** 채널에는 봇이 대표 메시지/이미지를 대신 올려줍니다.
+- **출력**: 대표 메시지와 페이지 이미지는 출력 채널(예: "같이보는 경매")로 전송됩니다.
+  - `TELEGRAM_AUCTION_CHANNEL_ID`가 이 출력 채널의 ID이며, **반드시 `-100`으로 시작**해야 합니다
+    (양수 숫자를 넣으면 봇 ID나 사용자 ID를 잘못 넣은 것입니다 — `validate-env`가 경고합니다).
+  - 입력봇은 이 출력 채널의 **관리자(admin)** 여야 메시지/이미지를 보낼 수 있습니다.
+- PDF 처리가 성공/실패/스킵 중 무엇이든 **입력봇 개인 대화방으로 결과 요약이 옵니다.**
+  아무 반응이 없다면 아래 "무반응일 때 확인하는 방법"을 따라가세요.
+
+### 무반응일 때 확인하는 방법
+
+workflow가 Success인데 채널/Notion에 아무것도 안 올라오고 개인 대화방에도 메시지가 없다면,
+아래 순서로 원인을 좁혀갑니다 (모두 토큰 값 자체는 출력하지 않습니다).
+
+```bash
+# 1. 필수 환경변수 + 채널 ID 형식 확인
+python -m husik.cli validate-env
+
+# 2. 봇 토큰/webhook 상태/출력 채널 접근 권한 진단 (가능하면 테스트 메시지 전송 후 삭제)
+python -m husik.cli telegram-diagnose
+
+# 3. 실제로 전송/처리는 하지 않고 getUpdates만 조회해서 PDF가 도착했는지 확인
+python -m husik.cli telegram-updates-dry-run
+```
+
+`telegram-updates-dry-run`으로 PDF가 안 보인다면 입력봇 개인 대화방에 PDF를 보냈는지,
+`TELEGRAM_ALLOWED_USER_ID`가 실제 보낸 사람과 일치하는지 확인하세요 — 입력봇 개인 대화방에서
+`/whoami`를 보내면 본인의 user_id를, `/chatid`를 보내면 현재 chat_id를 즉시 알려줍니다
+(`/ping`은 봇이 살아있는지 확인용, "pong"으로 응답). 이 세 명령은 PDF 처리 로직과 무관하게
+항상 즉시 응답하며, `TELEGRAM_ALLOWED_USER_ID`/`TELEGRAM_AUCTION_CHANNEL_ID` 설정 전에도 동작합니다.
+
+GitHub Actions에서 `telegram-pdf-ingest`를 실행하면 각 단계별 카운터
+(`updates_seen`, `allowed_user_passed`, `skipped_by_user`, `pdf_documents_seen`,
+`sent_telegram_cases`, `notion_upserted`, `errors_count` 등)가 워크플로우 로그에
+`PDF_INGEST_STAT` 접두사로 출력됩니다 (토큰/사용자 식별값 자체는 출력하지 않습니다).
+
 ## 핵심 동작 개요
 
 1. 사용자가 텔레그램 봇(개인 대화방)에 경매 PDF를 보냄
@@ -52,8 +94,14 @@ pip install -e ".[dev]"
 ## CLI 사용법
 
 ```bash
-# 필수 환경변수 검증
+# 필수 환경변수 검증 (+ TELEGRAM_AUCTION_CHANNEL_ID 형식 검증)
 python -m husik.cli validate-env
+
+# 봇 토큰/webhook/출력 채널 접근 권한 진단 (토큰 값은 출력하지 않음)
+python -m husik.cli telegram-diagnose
+
+# getUpdates만 조회 (실제 처리/전송 없음, --commit-offset 없으면 offset도 변경 안 함)
+python -m husik.cli telegram-updates-dry-run
 
 # 텔레그램 PDF polling (실서비스/스케줄러용)
 python -m husik.cli telegram-pdf-ingest
@@ -114,10 +162,17 @@ python -m husik.cli auction-monitor
 ## Notion 연동
 
 - `NOTION_TOKEN` + `NOTION_AUCTION_DB_URL`(또는 레거시 `NOTION_HUSIK_DB_ID`)로 "매수맛집 경매" DB에 접근합니다.
+- `NOTION_AUCTION_DB_URL`은 `notion.so/...?v=...`, `notion.so/workspace/slug-<32자리id>`,
+  `app.notion.com/p/<32자리id>` 형태를 모두 지원합니다.
+- 설정된 URL로 DB 접근이 실패하면(URL 오류, integration 미공유 등) Notion 검색 API로
+  "매수맛집 경매"라는 이름의 DB를 찾는 fallback을 자동으로 시도합니다.
 - 필요한 속성이 없으면 자동 생성을 시도하고, 실패하면 어떤 속성이 빠졌는지 명확한 오류 메시지를 출력합니다.
 - 사건번호(`사건번호` 속성) 기준으로 upsert합니다.
 - 본문에는 대표 메시지 내용 복사본, 블로그 링크 목록, 상태변경 기록을 append 방식으로 누적합니다.
 - 영상/MP3 파일은 Notion에 저장하지 않습니다.
+- **Notion 실패가 Telegram 전송을 막지 않습니다.** Notion이 완전히 실패해도 텔레그램 대표
+  메시지/이미지는 정상 전송되며, 개인 대화방에 "텔레그램 전송은 완료됐지만 노션 업데이트에
+  실패했습니다..." 알림이 옵니다.
 
 ## 상태 저장 (`data/state/`)
 
@@ -184,6 +239,24 @@ python -m husik.cli process-local-pdf data/inbox/sample.pdf --dry-run
 - 조회/파싱이 실패해도 전체 처리를 막지 않고 해당 필드를 "확인중"으로 둡니다.
 - 정확한 사건 상세 URL 생성이 어려운 경우 검색/메인 링크를 대신 넣습니다.
 
+## 텔레그램 이미지 전송 실패 fallback
+
+- 대표 메시지(사건별 1개)는 출력 채널로 전송을 시도하고, 실패하면(`sendMessage` 실패) 채널 ID/봇
+  관리자 권한 문제로 보고 해당 PDF의 나머지 사건 처리를 중단하며, 개인 대화방에 "텔레그램 채널
+  전송 실패..." 메시지를 보냅니다.
+- 이미지는 `sendMediaGroup`(최대 10장 단위, reply 포함)을 먼저 시도하고, 실패하면 reply 없이
+  재시도한 뒤, 그래도 실패하면 `sendPhoto`로 한 장씩 순서대로 재시도합니다.
+- `sendPhoto`가 그래도 실패하면 이미지를 압축/리사이즈한 뒤 한 번 더 재시도합니다.
+- 대표 메시지는 성공했지만 일부 이미지가 끝내 실패하면, 개인 대화방에 몇 장이 실패했는지
+  알려줍니다. PDF 원본 파일은 어떤 경우에도 전송하지 않습니다.
+
+## 채널 접근 진단(`telegram-diagnose`) 주의사항
+
+`telegram-diagnose`는 출력 채널 접근 권한을 확인하기 위해 `[시스템테스트]` 메시지를 채널에
+보낸 뒤 즉시 삭제를 시도합니다. **봇에게 메시지 삭제 권한이 없으면 이 테스트 메시지 1개가
+채널에 남을 수 있습니다** (진단 결과에 "삭제 권한이 없어 남아있을 수 있음"으로 표시됩니다).
+이는 의도된 동작이며, 채널 관리자 권한을 봇에게 부여하면 자동으로 삭제됩니다.
+
 ## 알려진 제한사항 (1차 MVP)
 
 - 경매마당/법원경매 adapter는 best-effort 수준이며, 실제 사건 상세 페이지 파싱(감정가/최저가/
@@ -191,6 +264,9 @@ python -m husik.cli process-local-pdf data/inbox/sample.pdf --dry-run
 - OpenAI Vision fallback은 페이지 텍스트 추출용으로만 쓰이며, 사건 구조화 자체는 정규식 기반입니다.
 - Tesseract가 설치되지 않은 환경(로컬)에서는 OCR 단계가 건너뛰어지고 native 텍스트 또는
   OpenAI Vision 결과만 사용됩니다.
+- PDF 전체에서 텍스트를 전혀 추출하지 못하면(OCR 전면 실패) "PDF 분석에 실패했습니다..."
+  알림이 오며, 텍스트는 있으나 사건번호/등급 조건을 못 채우면 "$$$ 이상 경매사건을 찾지
+  못했습니다." 알림이 옵니다 — 두 경우를 구분해서 알려줍니다.
 
 ## TODO (2차 이후 — MP3 쿠키봇, 이번 1차 범위 아님)
 

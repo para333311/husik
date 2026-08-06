@@ -33,7 +33,7 @@ jobs:
       - name: Install python dependencies
         run: pip install -e .
 
-      - name: Validate environment
+      - name: Validate environment (includes channel ID format check)
         env:
           TELEGRAM_AUCTION_BOT_TOKEN: ${{ secrets.TELEGRAM_AUCTION_BOT_TOKEN }}
           TELEGRAM_AUDIO_BOT_TOKEN: ${{ secrets.TELEGRAM_AUDIO_BOT_TOKEN }}
@@ -49,6 +49,7 @@ jobs:
         run: python -m husik.cli validate-env
 
       - name: Telegram PDF ingest
+        id: ingest
         env:
           TELEGRAM_AUCTION_BOT_TOKEN: ${{ secrets.TELEGRAM_AUCTION_BOT_TOKEN }}
           TELEGRAM_AUDIO_BOT_TOKEN: ${{ secrets.TELEGRAM_AUDIO_BOT_TOKEN }}
@@ -66,7 +67,14 @@ jobs:
           BLOG_MONITOR_ENABLED: ${{ secrets.BLOG_MONITOR_ENABLED }}
         run: python -m husik.cli telegram-pdf-ingest
 
+      - name: Print safe summary on failure
+        if: failure() && steps.ingest.outcome == 'failure'
+        run: |
+          echo "PDF ingest step failed. See the 'Telegram PDF ingest' step log above for"
+          echo "PDF_INGEST_STAT counters and error details (no secrets are logged there)."
+
       - name: Commit state changes
+        if: always()
         run: |
           git config user.name "husik-bot"
           git config user.email "husik-bot@users.noreply.github.com"

@@ -82,9 +82,26 @@ class NotionClient:
     def append_blocks(self, block_id: str, children: list[dict[str, Any]]) -> dict[str, Any]:
         return self._request("PATCH", f"/blocks/{block_id}/children", {"children": children})
 
+    def search_databases(self, query: str) -> list[dict[str, Any]]:
+        """Notion 통합 검색 API에서 database 객체만 필터링해 반환한다.
+
+        NOTION_AUCTION_DB_URL이 없거나 retrieve_database가 실패했을 때(권한 미공유,
+        URL 오류 등) DB를 이름으로 찾기 위한 fallback으로 사용한다.
+        """
+        body = {"query": query, "filter": {"property": "object", "value": "database"}}
+        result = self._request("POST", "/search", body)
+        return result.get("results", [])
+
 
 def extract_database_id(url_or_id: str) -> str:
-    """Notion DB URL 또는 raw id에서 dash 포함 database_id를 뽑아낸다."""
+    """Notion DB URL 또는 raw id에서 dash 포함 database_id를 뽑아낸다.
+
+    다음 형태를 모두 지원한다:
+    - https://www.notion.so/xxxxx?v=...
+    - https://www.notion.so/workspace/slug-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?v=...
+    - https://app.notion.com/p/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?v=...
+    - 순수 32자리 id (dash 유무 무관)
+    """
     if not url_or_id:
         raise ValueError("empty notion database url/id")
     match = UUID_RE.search(url_or_id.replace("-", ""))

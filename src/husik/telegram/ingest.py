@@ -1,16 +1,22 @@
-"""Telegram PDF 수신 -> PDF 분석 -> 사건 묶기 -> Telegram/Notion 반영 파이프라인."""
+"""Telegram PDF 수신 -> PDF 분석 -> 사건 묶기 -> Telegram/Notion 반영 파이프라인.
+
+이 모듈은 "workflow는 Success인데 아무 반응이 없는" 상태를 없애기 위해
+모든 단계에서 카운터를 남기고(IngestStats), 허용된 사용자가 PDF를 보내면
+반드시 성공/실패/스킵 중 하나의 메시지를 개인대화방으로 돌려준다.
+"""
 from __future__ import annotations
 
 import hashlib
 import logging
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from husik.auction.monitor import enrich_case
 from husik.blog.monitor import find_new_posts, is_within_days
 from husik.config import Config
-from husik.notion.client import NotionClient, extract_database_id
+from husik.notion.client import NotionClient
+from husik.notion.schema import resolve_database_id
 from husik.notion.upsert import NotionCaseData, upsert_case_page
 from husik.pdf.detect_cases import (
     CaseRecord,
@@ -22,11 +28,13 @@ from husik.pdf.detect_cases import (
 from husik.pdf.render import render_pdf_to_images
 from husik.state.store import CaseState, StateStore
 from husik.telegram.client import TelegramClient, TelegramError
+from husik.telegram.commands import handle_bot_command
 from husik.telegram.links import private_channel_message_link
 from husik.telegram.templates import (
     AuctionFields,
     CaseMessageData,
     InterestStats,
+    build_page_caption,
     build_representative_message,
 )
 
@@ -34,6 +42,57 @@ logger = logging.getLogger(__name__)
 
 MAX_ALBUM_SIZE = 10
 MAX_PDF_BYTES = 20 * 1024 * 1024  # Telegram Bot API 파일 다운로드 제한
+MIN_TEXT_FOR_OCR_SUCCESS = 5  # 이 미만이면 사실상 OCR이 아무 것도 못 읽은 것으로 간주
+
+DOWNLOAD_FAIL_MSG = "PDF 다운로드에 실패했습니다. 파일 크기 또는 텔레그램 파일 접근을 확인하세요."
+OCR_FAIL_MSG = "PDF 분석에 실패했습니다. 이미지 품질 또는 OCR 설정을 확인하세요."
+NO_QUALIFIED_MSG = "처리 완료: $$$ 이상 경매사건을 찾지 못했습니다."
+CHANNEL_FAIL_MSG = "텔레그램 채널 전송 실패: 채널 ID 또는 봇 관리자 권한을 확인하세요."
+NOTION_FAIL_MSG = (
+    "텔레그램 전송은 완료됐지만 노션 업데이트에 실패했습니다. Integration 연결 또는 DB URL을 확인하세요."
+)
+DUPLICATE_MSG = "이미 처리된 PDF입니다 (중복)."
+GENERIC_FAIL_MSG = "PDF 처리 중 오류가 발생했습니다."
+
+
+class OcrAnalysisError(Exception):
+    """OCR/텍스트 추출이 전면적으로 실패했을 때(모든 페이지가 텍스트를 전혀 못 읽음)."""
+
+
+class ChannelSendError(TelegramError):
+    """대표 메시지 전송(출력 채널) 자체가 실패했을 때."""
+
+
+@dataclass
+class IngestStats:
+    webhook_deleted_or_absent: int = 0
+    updates_seen: int = 0
+    messages_seen: int = 0
+    channel_posts_seen: int = 0
+    documents_seen: int = 0
+    pdf_documents_seen: int = 0
+    allowed_user_passed: int = 0
+    skipped_by_user: int = 0
+    downloaded_pdfs: int = 0
+    duplicate_pdfs_skipped: int = 0
+    pages_rendered: int = 0
+    detected_cases: int = 0
+    filtered_cases: int = 0
+    sent_telegram_cases: int = 0
+    sent_telegram_images: int = 0
+    notion_upserted: int = 0
+    user_notifications_sent: int = 0
+    errors_count: int = 0
+    # 필수 수정 8: 스킵 사유 세분화 (위 필수 카운터에 더한 보조 지표)
+    no_case_number_pdfs: int = 0
+    no_rating_cases: int = 0
+    ocr_failed_pdfs: int = 0
+
+    def log_summary(self) -> None:
+        logger.info("===== husik pdf ingest summary =====")
+        for f in fields(self):
+            logger.info("PDF_INGEST_STAT %s=%s", f.name, getattr(self, f.name))
+        logger.info("=====================================")
 
 
 @dataclass
@@ -45,6 +104,30 @@ class CaseProcessResult:
     page_end: int
     processed: bool
     reason: str = ""
+
+
+@dataclass
+class CaseOutcome:
+    case_number: str
+    telegram_sent: bool = False
+    images_sent: int = 0
+    images_failed: int = 0
+    notion_attempted: bool = False
+    notion_sent: bool = False
+
+
+@dataclass
+class PdfRunResult:
+    detected_cases: int = 0
+    qualified_cases: int = 0
+    channel_send_failed: bool = False
+    ocr_failed: bool = False
+    cases_sent: int = 0
+    images_sent: int = 0
+    images_failed: int = 0
+    notion_upserted: int = 0
+    any_notion_failed: bool = False
+    case_results: list[CaseProcessResult] = field(default_factory=list)
 
 
 def hash_file(path: Path) -> str:
@@ -66,7 +149,12 @@ def dry_run_report(records: list[CaseRecord]) -> list[CaseProcessResult]:
     results = []
     for r in records:
         processed = r.case_number in qualified_numbers
-        reason = "" if processed else "달러등급 $$$ 미만"
+        if processed:
+            reason = ""
+        elif r.rating is None:
+            reason = "달러등급 없음"
+        else:
+            reason = "달러등급 $$$ 미만"
         results.append(
             CaseProcessResult(
                 case_number=r.case_number,
@@ -79,6 +167,137 @@ def dry_run_report(records: list[CaseRecord]) -> list[CaseProcessResult]:
             )
         )
     return results
+
+
+def build_result_notifications(result: PdfRunResult) -> list[str]:
+    """PdfRunResult로부터 사용자 개인대화방에 보낼 메시지 목록을 만든다.
+
+    항상 최소 1개의 메시지를 반환한다 (완전 무반응 상태 방지).
+    """
+    if result.ocr_failed:
+        return [OCR_FAIL_MSG]
+    if result.channel_send_failed:
+        return [CHANNEL_FAIL_MSG]
+    if result.qualified_cases == 0:
+        return [NO_QUALIFIED_MSG]
+
+    notes: list[str] = []
+    if result.any_notion_failed:
+        notes.append(NOTION_FAIL_MSG)
+    notes.append(
+        f"처리 완료: {result.cases_sent}건 전송, {result.images_sent}개 이미지 생성, "
+        f"노션 {result.notion_upserted}건 업데이트"
+    )
+    if result.images_failed:
+        notes.append(f"이미지 일부 전송 실패: {result.images_failed}장 (텔레그램 전송 오류)")
+    return notes
+
+
+def _compress_for_retry(path: Path, max_dim: int = 1280, quality: int = 70) -> Path:
+    from PIL import Image
+
+    with Image.open(path) as img:
+        img = img.convert("RGB")
+        if max(img.size) > max_dim:
+            ratio = max_dim / max(img.size)
+            new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
+            img = img.resize(new_size, Image.LANCZOS)
+        out_path = path.with_name(f"{path.stem}_retry.jpg")
+        img.save(out_path, "JPEG", quality=quality, optimize=True)
+    return out_path
+
+
+def send_photo_with_fallback(
+    telegram: TelegramClient,
+    channel_id: str,
+    path: Path,
+    caption: str,
+    reply_to_message_id: int | None,
+) -> int | None:
+    """실패해도 예외를 던지지 않고 None을 반환한다 (호출자가 실패 카운트만 하면 됨)."""
+    try:
+        sent = telegram.send_photo(channel_id, path, caption=caption, reply_to_message_id=reply_to_message_id)
+        return sent["message_id"]
+    except TelegramError as exc:
+        logger.warning("send_photo failed for %s, retrying with compression: %s", path.name, exc)
+
+    compressed: Path | None = None
+    try:
+        compressed = _compress_for_retry(path)
+        sent = telegram.send_photo(channel_id, compressed, caption=caption)
+        return sent["message_id"]
+    except Exception as exc:
+        logger.warning("send_photo retry (compressed) failed for %s: %s", path.name, exc)
+        return None
+    finally:
+        if compressed is not None:
+            compressed.unlink(missing_ok=True)
+
+
+def _send_image_chunk(
+    telegram: TelegramClient,
+    channel_id: str,
+    chunk: list[Path],
+    captions: list[str],
+    reply_to_message_id: int,
+) -> tuple[list[int], int]:
+    if len(chunk) == 1:
+        msg_id = send_photo_with_fallback(telegram, channel_id, chunk[0], captions[0], reply_to_message_id)
+        return ([msg_id], 0) if msg_id is not None else ([], 1)
+
+    try:
+        result = telegram.send_media_group(
+            channel_id, chunk, captions, reply_to_message_id=reply_to_message_id
+        )
+        return [item["message_id"] for item in result if "message_id" in item], 0
+    except TelegramError as exc:
+        logger.warning("media group with reply failed, retrying without reply: %s", exc)
+
+    try:
+        result = telegram.send_media_group(channel_id, chunk, captions)
+        return [item["message_id"] for item in result if "message_id" in item], 0
+    except TelegramError as exc:
+        logger.warning("media group failed entirely, falling back to per-photo sendPhoto: %s", exc)
+
+    ids: list[int] = []
+    failed = 0
+    for path, caption in zip(chunk, captions, strict=False):
+        msg_id = send_photo_with_fallback(telegram, channel_id, path, caption, None)
+        if msg_id is None:
+            failed += 1
+        else:
+            ids.append(msg_id)
+    return ids, failed
+
+
+@dataclass
+class _CaseTelegramResult:
+    representative_message_id: int
+    image_message_ids: list[int]
+    images_failed: int
+
+
+def send_case_to_telegram(
+    telegram: TelegramClient, channel_id: str, record: CaseRecord, message_text: str
+) -> _CaseTelegramResult:
+    try:
+        sent = telegram.send_message(channel_id, message_text)
+    except TelegramError as exc:
+        raise ChannelSendError(str(exc)) from exc
+    rep_id = sent["message_id"]
+
+    image_ids: list[int] = []
+    images_failed = 0
+    paths = record.image_paths
+    for start in range(0, len(paths), MAX_ALBUM_SIZE):
+        chunk = paths[start : start + MAX_ALBUM_SIZE]
+        captions = [build_page_caption(p.page_no) for p in record.pages[start : start + MAX_ALBUM_SIZE]]
+        sent_ids, failed = _send_image_chunk(telegram, channel_id, chunk, captions, rep_id)
+        image_ids.extend(sent_ids)
+        images_failed += failed
+    return _CaseTelegramResult(
+        representative_message_id=rep_id, image_message_ids=image_ids, images_failed=images_failed
+    )
 
 
 def _to_message_data(record: CaseRecord, auction_info, interest: InterestStats) -> CaseMessageData:
@@ -105,38 +324,6 @@ def _to_message_data(record: CaseRecord, auction_info, interest: InterestStats) 
     )
 
 
-def send_case_to_telegram(
-    telegram: TelegramClient, channel_id: str, record: CaseRecord, message_text: str
-) -> tuple[int, list[int]]:
-    sent = telegram.send_message(channel_id, message_text)
-    rep_id = sent["message_id"]
-
-    image_ids: list[int] = []
-    paths = record.image_paths
-    for start in range(0, len(paths), MAX_ALBUM_SIZE):
-        chunk = paths[start : start + MAX_ALBUM_SIZE]
-        captions = [f"{p.page_no}p" for p in record.pages[start : start + MAX_ALBUM_SIZE]]
-        try:
-            if len(chunk) == 1:
-                result = [
-                    telegram.send_photo(
-                        channel_id, chunk[0], caption=captions[0], reply_to_message_id=rep_id
-                    )
-                ]
-            else:
-                result = telegram.send_media_group(channel_id, chunk, captions, reply_to_message_id=rep_id)
-        except TelegramError:
-            logger.warning("reply-send failed, falling back to plain send for case %s", record.case_number)
-            if len(chunk) == 1:
-                result = [telegram.send_photo(channel_id, chunk[0], caption=captions[0])]
-            else:
-                result = telegram.send_media_group(channel_id, chunk, captions)
-        for item in result:
-            if "message_id" in item:
-                image_ids.append(item["message_id"])
-    return rep_id, image_ids
-
-
 def _process_single_case(
     record: CaseRecord,
     config: Config,
@@ -144,7 +331,8 @@ def _process_single_case(
     telegram: TelegramClient,
     notion_client: NotionClient | None,
     database_id: str | None,
-) -> None:
+) -> CaseOutcome:
+    outcome = CaseOutcome(case_number=record.case_number)
     existing = state.get_case(record.case_number)
     auction_info = enrich_case(record.case_number, config)
 
@@ -171,15 +359,22 @@ def _process_single_case(
     message_data = _to_message_data(record, auction_info, interest)
     text = build_representative_message(message_data)
 
-    rep_id, image_ids = send_case_to_telegram(telegram, config.telegram_auction_channel_id, record, text)
-    message_link = private_channel_message_link(config.telegram_auction_channel_id, rep_id)
+    # ChannelSendError는 여기서 잡지 않고 호출자(process_pdf_and_send)로 전파한다.
+    send_result = send_case_to_telegram(telegram, config.telegram_auction_channel_id, record, text)
+    outcome.telegram_sent = True
+    outcome.images_sent = len(send_result.image_message_ids)
+    outcome.images_failed = send_result.images_failed
+
+    message_link = private_channel_message_link(
+        config.telegram_auction_channel_id, send_result.representative_message_id
+    )
 
     sale_date = auction_info.sale_date
     case_state = CaseState(
         case_number=record.case_number,
         channel_id=config.telegram_auction_channel_id,
-        representative_message_id=rep_id,
-        image_message_ids=image_ids,
+        representative_message_id=send_result.representative_message_id,
+        image_message_ids=send_result.image_message_ids,
         rating=record.rating,
         title=record.title,
         status=auction_info.status or "확인중",
@@ -201,37 +396,115 @@ def _process_single_case(
         },
     )
 
-    if notion_client and database_id:
-        try:
-            notion_data = NotionCaseData(
-                case_number=record.case_number,
-                title=record.title,
-                rating=record.rating or "$$$",
-                item_number="확인중",
-                court=auction_info.court or "확인중",
-                address=auction_info.address or "확인중",
-                appraisal_price=auction_info.appraisal_price,
-                min_price=auction_info.min_price,
-                sale_date=auction_info.sale_date,
-                status=auction_info.status or "확인중",
-                winning_price=auction_info.winning_price,
-                winning_rate=auction_info.winning_rate,
-                bidder_count=auction_info.bidder_count,
-                court_views=auction_info.court_views,
-                madangs_views=auction_info.madangs_views,
-                blog_mentions=len(blog_urls),
-                recent_blog_mentions=recent_count,
-                madangs_link=auction_info.madangs_link or "확인중",
-                court_link=auction_info.court_link or "확인중",
-                telegram_message_link=message_link,
-            )
-            page_id = upsert_case_page(notion_client, database_id, notion_data, log_lines=[text])
-            case_state.notion_page_id = page_id
-        except Exception:
-            logger.exception("notion upsert failed for %s", record.case_number)
+    if notion_client:
+        outcome.notion_attempted = True
+        if database_id:
+            try:
+                notion_data = NotionCaseData(
+                    case_number=record.case_number,
+                    title=record.title,
+                    rating=record.rating or "$$$",
+                    item_number="확인중",
+                    court=auction_info.court or "확인중",
+                    address=auction_info.address or "확인중",
+                    appraisal_price=auction_info.appraisal_price,
+                    min_price=auction_info.min_price,
+                    sale_date=auction_info.sale_date,
+                    status=auction_info.status or "확인중",
+                    winning_price=auction_info.winning_price,
+                    winning_rate=auction_info.winning_rate,
+                    bidder_count=auction_info.bidder_count,
+                    court_views=auction_info.court_views,
+                    madangs_views=auction_info.madangs_views,
+                    blog_mentions=len(blog_urls),
+                    recent_blog_mentions=recent_count,
+                    madangs_link=auction_info.madangs_link or "확인중",
+                    court_link=auction_info.court_link or "확인중",
+                    telegram_message_link=message_link,
+                )
+                page_id = upsert_case_page(notion_client, database_id, notion_data, log_lines=[text])
+                case_state.notion_page_id = page_id
+                outcome.notion_sent = True
+            except Exception:
+                logger.exception("notion upsert failed for %s", record.case_number)
+        else:
+            logger.error("notion database_id를 확보하지 못해 %s upsert를 건너뜁니다", record.case_number)
 
     state.upsert_case(case_state)
     state.save()
+    return outcome
+
+
+def process_pdf_and_send(
+    pdf_path: Path, config: Config, state: StateStore, tmp_root: Path, stats: IngestStats
+) -> PdfRunResult:
+    """실제 Telegram/Notion 반영까지 수행하고, 사용자 알림에 필요한 결과를 돌려준다."""
+    result = PdfRunResult()
+    work_dir = tmp_root / f"work_{hash_file(pdf_path)[:12]}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        rendered_pages = render_pdf_to_images(pdf_path, work_dir)
+        stats.pages_rendered += len(rendered_pages)
+        analyses = [analyze_page(p, config.openai_api_key) for p in rendered_pages]
+        records = group_pages_into_cases(analyses)
+        result.detected_cases = len(records)
+        stats.detected_cases += len(records)
+
+        if not records:
+            non_empty_pages = sum(1 for a in analyses if len(a.raw_text.strip()) >= MIN_TEXT_FOR_OCR_SUCCESS)
+            if rendered_pages and non_empty_pages == 0:
+                stats.ocr_failed_pdfs += 1
+                stats.errors_count += 1
+                result.ocr_failed = True
+            else:
+                stats.no_case_number_pdfs += 1
+            return result
+
+        for r in records:
+            if r.rating is None:
+                stats.no_rating_cases += 1
+
+        qualified = filter_qualified_cases(records)
+        result.qualified_cases = len(qualified)
+        stats.filtered_cases += len(qualified)
+
+        if not qualified:
+            return result
+
+        telegram = TelegramClient(config.telegram_auction_bot_token)
+        notion_client = NotionClient(config.notion_token) if config.notion_token else None
+        database_id = (
+            resolve_database_id(notion_client, config.notion_auction_db_url) if notion_client else None
+        )
+
+        for record in qualified:
+            try:
+                outcome = _process_single_case(record, config, state, telegram, notion_client, database_id)
+            except ChannelSendError:
+                logger.exception("telegram channel send failed for case %s", record.case_number)
+                result.channel_send_failed = True
+                stats.errors_count += 1
+                break
+            except Exception:
+                logger.exception("failed to process case %s", record.case_number)
+                stats.errors_count += 1
+                continue
+
+            result.cases_sent += 1
+            result.images_sent += outcome.images_sent
+            result.images_failed += outcome.images_failed
+            if outcome.notion_attempted:
+                if outcome.notion_sent:
+                    result.notion_upserted += 1
+                else:
+                    result.any_notion_failed = True
+
+        stats.sent_telegram_cases += result.cases_sent
+        stats.sent_telegram_images += result.images_sent
+        stats.notion_upserted += result.notion_upserted
+        return result
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def process_pdf(
@@ -241,76 +514,144 @@ def process_pdf(
     send: bool,
     tmp_root: Path,
 ) -> list[CaseProcessResult]:
-    """PDF 하나를 분석하고, send=True면 실제 Telegram/Notion 반영까지 수행한다."""
+    """CLI process-local-pdf 용. send=True면 실제 반영까지 수행한다."""
     work_dir = tmp_root / f"work_{hash_file(pdf_path)[:12]}"
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
         records = analyze_pdf(pdf_path, work_dir, config.openai_api_key)
         results = dry_run_report(records)
-
         if not send:
             return results
-
-        telegram = TelegramClient(config.telegram_auction_bot_token)
-        notion_client = NotionClient(config.notion_token) if config.notion_token else None
-        database_id = (
-            extract_database_id(config.notion_auction_db_url)
-            if notion_client and config.notion_auction_db_url
-            else None
-        )
-
-        for record in filter_qualified_cases(records):
-            try:
-                _process_single_case(record, config, state, telegram, notion_client, database_id)
-            except Exception:
-                logger.exception("failed to process case %s", record.case_number)
-
-        return results
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
+    stats = IngestStats()
+    process_pdf_and_send(pdf_path, config, state, tmp_root, stats)
+    stats.log_summary()
+    return results
 
-def poll_and_ingest(config: Config, state: StateStore) -> None:
+
+def poll_and_ingest(config: Config, state: StateStore) -> IngestStats:
+    stats = IngestStats()
     telegram = TelegramClient(config.telegram_auction_bot_token)
     tmp_root = config.tmp_dir
     tmp_root.mkdir(parents=True, exist_ok=True)
 
-    updates = telegram.get_updates(offset=state.telegram_offset or None)
+    try:
+        webhook_info = telegram.get_webhook_info()
+        had_webhook = bool(webhook_info.get("url"))
+        telegram.delete_webhook(drop_pending_updates=False)
+        stats.webhook_deleted_or_absent = 1
+        logger.info(
+            "webhook %s (getUpdates polling과 webhook은 동시에 쓸 수 없음)",
+            "was set and has now been deleted" if had_webhook else "was already absent (정상)",
+        )
+    except Exception:
+        logger.exception("failed to check/delete webhook before polling")
+        stats.errors_count += 1
+
+    try:
+        updates = telegram.get_updates(
+            offset=state.telegram_offset or None, allowed_updates=["message", "channel_post"]
+        )
+    except Exception:
+        logger.exception("getUpdates failed")
+        stats.errors_count += 1
+        stats.log_summary()
+        return stats
+
+    stats.updates_seen = len(updates)
+    if not updates:
+        logger.info("updates_seen=0 (신규 텔레그램 update 없음)")
+
     for update in updates:
         update_id = update["update_id"]
+        # PDF 유실 방지: 처리 전에 offset부터 올려서 저장한다. 처리가 실패해도
+        # 같은 update를 무한 재시도하며 막히지 않도록 한다.
         state.telegram_offset = update_id + 1
+        state.save()
         try:
-            _handle_update(update, config, state, telegram, tmp_root)
+            _handle_update(update, config, state, telegram, tmp_root, stats)
         except Exception:
             logger.exception("failed to handle update %s", update_id)
+            stats.errors_count += 1
+            _notify_generic_failure(telegram, update, stats)
         state.save()
+
+    stats.log_summary()
+    return stats
+
+
+def _notify_generic_failure(telegram: TelegramClient, update: dict, stats: IngestStats) -> None:
+    """update 처리 자체가 예기치 못하게 실패해도 가능하면 사용자에게 알린다."""
+    try:
+        message = update.get("message") or {}
+        chat = message.get("chat", {})
+        if chat.get("type") == "private" and chat.get("id"):
+            telegram.send_message(
+                chat["id"], "PDF 처리 중 예기치 못한 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
+            )
+            stats.user_notifications_sent += 1
+    except Exception:
+        logger.exception("failed to notify user about generic failure")
 
 
 def _handle_update(
-    update: dict, config: Config, state: StateStore, telegram: TelegramClient, tmp_root: Path
+    update: dict,
+    config: Config,
+    state: StateStore,
+    telegram: TelegramClient,
+    tmp_root: Path,
+    stats: IngestStats,
 ) -> None:
+    if update.get("channel_post") is not None:
+        stats.channel_posts_seen += 1
+        return
+
     message = update.get("message")
     if not message:
         return
+    stats.messages_seen += 1
 
     chat = message.get("chat", {})
     from_user = message.get("from", {})
+    chat_id = chat.get("id")
+
+    text = message.get("text")
+    if chat.get("type") == "private" and text and text.startswith("/"):
+        response = handle_bot_command(text, from_user.get("id"), chat_id)
+        if response is not None:
+            try:
+                telegram.send_message(chat_id, response)
+                stats.user_notifications_sent += 1
+            except Exception:
+                logger.exception("failed to respond to bot command")
+                stats.errors_count += 1
+        return
+
     if chat.get("type") != "private":
         return
+
     allowed_id = config.telegram_allowed_user_id
     if not allowed_id or str(from_user.get("id")) != str(allowed_id):
-        logger.info("ignoring message from unauthorized user")
+        stats.skipped_by_user += 1
+        logger.info("skipped message from a non-allowed user in private chat")
         return
+    stats.allowed_user_passed += 1
 
     document = message.get("document")
+    if document:
+        stats.documents_seen += 1
     if not document or document.get("mime_type") != "application/pdf":
         return
+    stats.pdf_documents_seen += 1
 
-    chat_id = chat["id"]
     file_id = document["file_id"]
     file_size = document.get("file_size") or 0
     if file_size and file_size > MAX_PDF_BYTES:
-        telegram.send_message(chat_id, "PDF 용량이 너무 큽니다 (20MB 제한). 더 작은 파일로 다시 보내주세요.")
+        telegram.send_message(chat_id, DOWNLOAD_FAIL_MSG)
+        stats.user_notifications_sent += 1
+        stats.errors_count += 1
         return
 
     pdf_path = tmp_root / f"in_{update['update_id']}.pdf"
@@ -319,26 +660,30 @@ def _handle_update(
         telegram.download_file(file_info["file_path"], pdf_path)
     except Exception:
         logger.exception("pdf download failed")
-        telegram.send_message(chat_id, "PDF 다운로드에 실패했습니다. 잠시 후 다시 시도해주세요.")
+        telegram.send_message(chat_id, DOWNLOAD_FAIL_MSG)
+        stats.user_notifications_sent += 1
+        stats.errors_count += 1
         return
+    stats.downloaded_pdfs += 1
 
     try:
         pdf_hash = hash_file(pdf_path)
         if state.has_processed_pdf(pdf_hash):
-            telegram.send_message(chat_id, "이미 처리된 PDF입니다 (중복).")
+            stats.duplicate_pdfs_skipped += 1
+            telegram.send_message(chat_id, DUPLICATE_MSG)
+            stats.user_notifications_sent += 1
             return
 
-        results = process_pdf(pdf_path, config, state, send=True, tmp_root=tmp_root)
+        run_result = process_pdf_and_send(pdf_path, config, state, tmp_root, stats)
         state.mark_pdf_processed(pdf_hash, {"file_name": document.get("file_name", "")})
 
-        qualified = [r for r in results if r.processed]
-        if qualified:
-            summary = "\n".join(f"- {r.case_number} {r.rating} {r.title}" for r in qualified)
-            telegram.send_message(chat_id, f"처리 완료: {len(qualified)}건\n{summary}")
-        else:
-            telegram.send_message(chat_id, "처리할 사건이 없습니다 ($$$ 이상 등급 없음).")
+        for note in build_result_notifications(run_result):
+            telegram.send_message(chat_id, note)
+            stats.user_notifications_sent += 1
     except Exception:
         logger.exception("pdf processing failed")
-        telegram.send_message(chat_id, "PDF 처리 중 오류가 발생했습니다.")
+        telegram.send_message(chat_id, GENERIC_FAIL_MSG)
+        stats.user_notifications_sent += 1
+        stats.errors_count += 1
     finally:
         pdf_path.unlink(missing_ok=True)
