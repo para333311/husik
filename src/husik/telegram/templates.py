@@ -9,6 +9,8 @@ from husik.utils.money import format_money, format_rate
 
 MESSAGE_LIMIT = 3800
 DIVIDER = "-" * 20
+# 달러 기호 등급은 제목 앞에 그대로 붙이고, 그 외(낮은등급/등급확인)는 대괄호로 감싼다.
+DOLLAR_SIGN_RATINGS = {"$$$", "$$$$", "$$$$$"}
 
 
 @dataclass
@@ -73,7 +75,9 @@ def auction_fields_from_dict(data: dict) -> AuctionFields:
 
 def build_header(data: CaseMessageData, event_tag: str | None = None) -> str:
     deadline = format_deadline_label(data.auction.sale_date)
-    base = f"[{deadline}] {data.rating} {data.title}"
+    rating = data.rating or "등급확인"
+    rating_part = rating if rating in DOLLAR_SIGN_RATINGS else f"[{rating}]"
+    base = f"[{deadline}] {rating_part} {data.title}"
     return f"[{event_tag}] {base}" if event_tag else base
 
 

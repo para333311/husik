@@ -23,6 +23,7 @@ from husik.telegram.templates import (
     build_award_update,
     build_event_update,
 )
+from husik.utils.text import RATING_UNKNOWN
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +111,7 @@ def _monitor_case_auction(
     )
     message_data = CaseMessageData(
         case_number=case.case_number,
-        rating=case.rating or "$$$",
+        rating=case.rating or RATING_UNKNOWN,
         title=case.title,
         auction=auction,
         interest=InterestStats(
@@ -147,7 +148,7 @@ def _monitor_case_auction(
             notion_data = NotionCaseData(
                 case_number=case.case_number,
                 title=case.title,
-                rating=case.rating or "$$$",
+                rating=case.rating or RATING_UNKNOWN,
                 item_number="확인중",
                 court=auction.court,
                 address=auction.address,

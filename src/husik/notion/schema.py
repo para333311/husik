@@ -13,7 +13,9 @@ DATABASE_DISPLAY_NAME = "매수맛집 경매"
 
 REQUIRED_PROPERTIES: dict[str, dict[str, Any]] = {
     "제목": {"title": {}},
-    "달러등급": {"select": {"options": [{"name": n} for n in ["$$$", "$$$$", "$$$$$", "$$$$$$"]]}},
+    "달러등급": {
+        "select": {"options": [{"name": n} for n in ["$$$$$", "$$$$", "$$$", "낮은등급", "등급확인"]]}
+    },
     "달러개수": {"number": {}},
     "사건번호": {"rich_text": {}},
     "물건번호": {"rich_text": {}},

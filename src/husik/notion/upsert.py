@@ -8,6 +8,7 @@ from typing import Any
 
 from husik.notion.client import NotionClient
 from husik.notion.schema import ensure_schema
+from husik.utils.text import rating_to_count
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ def build_properties(data: NotionCaseData, name_map: dict[str, str], today: date
     return {
         name_map["제목"]: {"title": [{"type": "text", "text": {"content": data.title[:200]}}]},
         "달러등급": {"select": {"name": data.rating}},
-        "달러개수": _num(len(data.rating or "")),
+        "달러개수": _num(rating_to_count(data.rating)),
         "사건번호": _rich(data.case_number),
         "물건번호": _rich(data.item_number),
         "법원": _rich(data.court),

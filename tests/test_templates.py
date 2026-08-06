@@ -86,3 +86,22 @@ def test_truncate_message_respects_limit():
     truncated = truncate_message(long_text, limit=100)
     assert len(truncated) <= 130
     assert truncated != long_text
+
+
+def test_representative_message_header_low_grade_uses_brackets():
+    data = CaseMessageData(case_number="2024타경1", rating="낮은등급", title="제목")
+    text = build_representative_message(data)
+    assert text.startswith("[입찰일 확인중] [낮은등급] 제목")
+
+
+def test_representative_message_header_grade_unknown_uses_brackets():
+    data = CaseMessageData(case_number="2024타경1", rating="등급확인", title="제목")
+    text = build_representative_message(data)
+    assert text.startswith("[입찰일 확인중] [등급확인] 제목")
+
+
+def test_representative_message_header_dollar_rating_not_bracketed():
+    data = CaseMessageData(case_number="2024타경1", rating="$$$", title="사당 15 추천 $$$")
+    text = build_representative_message(data)
+    assert text.startswith("[입찰일 확인중] $$$ 사당 15 추천 $$$")
+    assert "[$$$]" not in text

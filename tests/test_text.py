@@ -1,9 +1,16 @@
 from husik.utils.text import (
+    RATING_3,
+    RATING_4,
+    RATING_5,
+    RATING_LOW,
+    RATING_UNKNOWN,
+    classify_rating,
     dollar_count,
     extract_case_numbers,
     extract_dollar_rating,
     extract_title_candidates,
     normalize_case_number,
+    rating_to_count,
 )
 
 
@@ -13,6 +20,23 @@ def test_normalize_case_number_no_space():
 
 def test_normalize_case_number_with_spaces():
     assert normalize_case_number("2024 타경 12345") == "2024타경12345"
+
+
+def test_normalize_case_number_space_before_only():
+    assert normalize_case_number("2025 타경102095") == "2025타경102095"
+
+
+def test_normalize_case_number_space_after_only():
+    assert normalize_case_number("2025타경 102095") == "2025타경102095"
+
+
+def test_normalize_case_number_allows_seven_digit_numbers():
+    assert normalize_case_number("2025타경1234567") == "2025타경1234567"
+
+
+def test_extract_case_numbers_finds_all_spacing_variants():
+    text = "2025타경102095 / 2025 타경 102095 / 2025타경 102095 / 2025 타경102095 / 2024타경12345"
+    assert extract_case_numbers(text) == ["2025타경102095", "2024타경12345"]
 
 
 def test_extract_case_numbers_dedup_preserves_order():
@@ -41,3 +65,59 @@ def test_extract_title_candidates_skips_case_and_dollar_lines():
     text = "강남 아파트 특급매물\n2024타경12345\n$$$$\n"
     candidates = extract_title_candidates(text)
     assert candidates == ["강남 아파트 특급매물"]
+
+
+# --- classify_rating: 필터가 아니라 분류 태그 -----------------------------------
+
+
+def test_classify_rating_case_number_only_no_rating_hint():
+    text = "2025타경102095"
+    assert classify_rating(text) == RATING_UNKNOWN
+
+
+def test_classify_rating_dollar_signs():
+    text = "2025타경102095\n사당 15 추천 $$$"
+    assert classify_rating(text) == RATING_3
+
+
+def test_classify_rating_s_letters_near_keyword():
+    text = "2025타경102095\n사당 15 추천 SSS"
+    assert classify_rating(text) == RATING_3
+
+
+def test_classify_rating_digit_near_keyword():
+    text = "2025타경102095\n사당 15 추천 3"
+    assert classify_rating(text) == RATING_3
+
+
+def test_classify_rating_two_dollar_signs_is_low_grade():
+    text = "2025타경102095\n추천 $$"
+    assert classify_rating(text) == RATING_LOW
+
+
+def test_classify_rating_digit_word_form():
+    assert classify_rating("추천 매물, 4달러 등급") == RATING_4
+
+
+def test_classify_rating_five_dollar_signs():
+    assert classify_rating("추천 $$$$$") == RATING_5
+
+
+def test_classify_rating_bare_digit_without_keyword_is_ignored():
+    # "추천"/"등급"/"달러" 근처가 아니면 숫자 3/4/5를 등급으로 보지 않는다.
+    text = "물건번호 3, 낙찰가 4억 5천만원"
+    assert classify_rating(text) == RATING_UNKNOWN
+
+
+def test_classify_rating_bare_s_letters_without_keyword_is_ignored():
+    text = "SSS 브랜드 매장 임대"
+    assert classify_rating(text) == RATING_UNKNOWN
+
+
+def test_rating_to_count_mapping():
+    assert rating_to_count(RATING_5) == 5
+    assert rating_to_count(RATING_4) == 4
+    assert rating_to_count(RATING_3) == 3
+    assert rating_to_count(RATING_LOW) == 0
+    assert rating_to_count(RATING_UNKNOWN) == 0
+    assert rating_to_count(None) == 0

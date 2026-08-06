@@ -5,6 +5,10 @@
 - 같은 사건번호가 여러 페이지에 반복돼도 하나의 사건으로 유지.
 - 달러등급은 사건 시작 페이지 주변(RATING_LOOKAHEAD_PAGES)에서만 판단하고,
   이후 반복되는 달러 표시로 등급이 바뀌지 않는다.
+
+정책(2차): 달러등급은 더 이상 필터가 아니라 분류 태그다. 사건번호가 감지되면
+등급과 무관하게 무조건 CaseRecord로 등록된다. 등급을 못 찾으면 "등급확인",
+$/$$ 수준으로만 잡히면 "낮은등급"으로 분류한다 (utils.text.classify_rating 참고).
 """
 from __future__ import annotations
 
@@ -14,15 +18,20 @@ from pathlib import Path
 from husik.pdf.ocr import extract_page_text
 from husik.pdf.render import RenderedPage
 from husik.utils.text import (
-    dollar_count,
+    RATING_3,
+    RATING_4,
+    RATING_5,
+    RATING_LOW,
+    RATING_UNKNOWN,
+    classify_rating,
     extract_case_numbers,
-    extract_dollar_rating,
     extract_title_candidates,
+    rating_to_count,
 )
 
-MIN_DOLLAR_COUNT = 3
 RATING_LOOKAHEAD_PAGES = 3
 MIN_TITLE_LENGTH = 4
+_RATING_PRIORITY = {RATING_5: 5, RATING_4: 4, RATING_3: 3, RATING_LOW: 1, RATING_UNKNOWN: 0}
 
 
 @dataclass
@@ -47,7 +56,7 @@ class PageAnalysis:
 @dataclass
 class CaseRecord:
     case_number: str
-    rating: str | None
+    rating: str
     title: str
     page_start: int
     page_end: int
@@ -55,7 +64,7 @@ class CaseRecord:
 
     @property
     def dollar_count(self) -> int:
-        return dollar_count(self.rating)
+        return rating_to_count(self.rating)
 
     @property
     def image_paths(self) -> list[Path]:
@@ -67,7 +76,7 @@ def analyze_page(rendered: RenderedPage, openai_api_key: str | None = None) -> P
     return PageAnalysis(
         page_no=rendered.page_no,
         case_numbers=extract_case_numbers(text),
-        rating=extract_dollar_rating(text),
+        rating=classify_rating(text),
         title_candidates=extract_title_candidates(text),
         raw_text=text,
         image_path=rendered.image_path,
@@ -82,10 +91,15 @@ def _pick_title(pages: list[PageAnalysis], fallback: str) -> str:
     return fallback
 
 
-def _pick_rating(pages: list[PageAnalysis]) -> str | None:
-    best: str | None = None
+def _pick_rating_label(pages: list[PageAnalysis]) -> str:
+    """사건 시작 페이지 주변(RATING_LOOKAHEAD_PAGES)에서 가장 높은 등급을 고른다.
+
+    후보가 전혀 없으면(모든 페이지가 "등급확인") "등급확인"을 반환한다 — 더 이상
+    필터링 대상이 아니라 분류 태그이므로 None을 반환하지 않는다.
+    """
+    best = RATING_UNKNOWN
     for page in pages[:RATING_LOOKAHEAD_PAGES]:
-        if page.rating and (best is None or len(page.rating) > len(best)):
+        if _RATING_PRIORITY.get(page.rating, 0) > _RATING_PRIORITY.get(best, 0):
             best = page.rating
     return best
 
@@ -99,7 +113,7 @@ def group_pages_into_cases(pages: list[PageAnalysis]) -> list[CaseRecord]:
         if found and (current is None or found != current.case_number):
             current = CaseRecord(
                 case_number=found,
-                rating=None,
+                rating=RATING_UNKNOWN,
                 title="",
                 page_start=page.page_no,
                 page_end=page.page_no,
@@ -113,12 +127,7 @@ def group_pages_into_cases(pages: list[PageAnalysis]) -> list[CaseRecord]:
         current.page_end = page.page_no
 
     for record in records:
-        record.rating = _pick_rating(record.pages)
+        record.rating = _pick_rating_label(record.pages)
         record.title = _pick_title(record.pages, fallback=record.case_number)
 
     return records
-
-
-def filter_qualified_cases(records: list[CaseRecord]) -> list[CaseRecord]:
-    """$$$ 미만(달러 없음 포함)은 버리고 $$$ 이상만 남긴다."""
-    return [r for r in records if r.dollar_count >= MIN_DOLLAR_COUNT]

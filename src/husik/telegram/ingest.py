@@ -22,7 +22,6 @@ from husik.pdf.detect_cases import (
     CaseRecord,
     PageAnalysis,
     analyze_page,
-    filter_qualified_cases,
     group_pages_into_cases,
 )
 from husik.pdf.render import render_pdf_to_images
@@ -37,6 +36,7 @@ from husik.telegram.templates import (
     build_page_caption,
     build_representative_message,
 )
+from husik.utils.text import RATING_UNKNOWN
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ MIN_TEXT_FOR_OCR_SUCCESS = 5  # 이 미만이면 사실상 OCR이 아무 것도 
 
 DOWNLOAD_FAIL_MSG = "PDF 다운로드에 실패했습니다. 파일 크기 또는 텔레그램 파일 접근을 확인하세요."
 OCR_FAIL_MSG = "PDF 분석에 실패했습니다. 이미지 품질 또는 OCR 설정을 확인하세요."
-NO_QUALIFIED_MSG = "처리 완료: $$$ 이상 경매사건을 찾지 못했습니다."
+NO_CASE_MSG = "처리 완료: 사건번호를 찾지 못했습니다. OCR/Vision 분석 개선이 필요합니다."
 CHANNEL_FAIL_MSG = "텔레그램 채널 전송 실패: 채널 ID 또는 봇 관리자 권한을 확인하세요."
 NOTION_FAIL_MSG = (
     "텔레그램 전송은 완료됐지만 노션 업데이트에 실패했습니다. Integration 연결 또는 DB URL을 확인하세요."
@@ -119,7 +119,6 @@ class CaseOutcome:
 @dataclass
 class PdfRunResult:
     detected_cases: int = 0
-    qualified_cases: int = 0
     channel_send_failed: bool = False
     ocr_failed: bool = False
     cases_sent: int = 0
@@ -145,25 +144,18 @@ def analyze_pdf(pdf_path: Path, work_dir: Path, openai_api_key: str | None) -> l
 
 
 def dry_run_report(records: list[CaseRecord]) -> list[CaseProcessResult]:
-    qualified_numbers = {r.case_number for r in filter_qualified_cases(records)}
+    """사건번호가 감지된 사건은 등급과 무관하게 전부 전송 대상이다 (정책: 필터 아님, 분류만)."""
     results = []
     for r in records:
-        processed = r.case_number in qualified_numbers
-        if processed:
-            reason = ""
-        elif r.rating is None:
-            reason = "달러등급 없음"
-        else:
-            reason = "달러등급 $$$ 미만"
         results.append(
             CaseProcessResult(
                 case_number=r.case_number,
-                rating=r.rating or "-",
+                rating=r.rating,
                 title=r.title,
                 page_start=r.page_start,
                 page_end=r.page_end,
-                processed=processed,
-                reason=reason,
+                processed=True,
+                reason="",
             )
         )
     return results
@@ -178,15 +170,15 @@ def build_result_notifications(result: PdfRunResult) -> list[str]:
         return [OCR_FAIL_MSG]
     if result.channel_send_failed:
         return [CHANNEL_FAIL_MSG]
-    if result.qualified_cases == 0:
-        return [NO_QUALIFIED_MSG]
+    if result.detected_cases == 0:
+        return [NO_CASE_MSG]
 
     notes: list[str] = []
     if result.any_notion_failed:
         notes.append(NOTION_FAIL_MSG)
     notes.append(
-        f"처리 완료: {result.cases_sent}건 전송, {result.images_sent}개 이미지 생성, "
-        f"노션 {result.notion_upserted}건 업데이트"
+        f"처리 완료: 사건번호 {result.detected_cases}개 감지, {result.cases_sent}건 전송, "
+        f"{result.images_sent}개 이미지 생성, 노션 {result.notion_upserted}건 업데이트"
     )
     if result.images_failed:
         notes.append(f"이미지 일부 전송 실패: {result.images_failed}장 (텔레그램 전송 오류)")
@@ -316,7 +308,7 @@ def _to_message_data(record: CaseRecord, auction_info, interest: InterestStats) 
     )
     return CaseMessageData(
         case_number=record.case_number,
-        rating=record.rating or "",
+        rating=record.rating or RATING_UNKNOWN,
         title=record.title,
         auction=auction,
         interest=interest,
@@ -403,7 +395,7 @@ def _process_single_case(
                 notion_data = NotionCaseData(
                     case_number=record.case_number,
                     title=record.title,
-                    rating=record.rating or "$$$",
+                    rating=record.rating or RATING_UNKNOWN,
                     item_number="확인중",
                     court=auction_info.court or "확인중",
                     address=auction_info.address or "확인중",
@@ -461,15 +453,11 @@ def process_pdf_and_send(
             return result
 
         for r in records:
-            if r.rating is None:
+            if r.rating == RATING_UNKNOWN:
                 stats.no_rating_cases += 1
-
-        qualified = filter_qualified_cases(records)
-        result.qualified_cases = len(qualified)
-        stats.filtered_cases += len(qualified)
-
-        if not qualified:
-            return result
+        # 정책: 달러등급은 필터가 아니라 분류 태그. 사건번호가 감지된 사건은 등급과
+        # 무관하게 전부 전송 대상이다 (filtered_cases는 detected_cases와 동일하게 유지).
+        stats.filtered_cases += len(records)
 
         telegram = TelegramClient(config.telegram_auction_bot_token)
         notion_client = NotionClient(config.notion_token) if config.notion_token else None
@@ -477,7 +465,7 @@ def process_pdf_and_send(
             resolve_database_id(notion_client, config.notion_auction_db_url) if notion_client else None
         )
 
-        for record in qualified:
+        for record in records:
             try:
                 outcome = _process_single_case(record, config, state, telegram, notion_client, database_id)
             except ChannelSendError:
@@ -675,7 +663,12 @@ def _handle_update(
             return
 
         run_result = process_pdf_and_send(pdf_path, config, state, tmp_root, stats)
-        state.mark_pdf_processed(pdf_hash, {"file_name": document.get("file_name", "")})
+        # 성공 기준 = 사건번호 기준 전송 성공. 사건번호를 못 찾았거나(0건) 텔레그램
+        # 전송이 실패했으면 해시를 저장하지 않아 같은 PDF를 다시 보내면 재처리된다.
+        if run_result.cases_sent > 0:
+            state.mark_pdf_processed(pdf_hash, {"file_name": document.get("file_name", "")})
+        else:
+            logger.info("pdf not marked as processed (no case successfully sent); can be retried")
 
         for note in build_result_notifications(run_result):
             telegram.send_message(chat_id, note)

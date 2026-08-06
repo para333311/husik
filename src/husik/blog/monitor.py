@@ -19,6 +19,7 @@ from husik.telegram.templates import (
     auction_fields_from_dict,
     build_event_update,
 )
+from husik.utils.text import RATING_UNKNOWN
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,7 @@ def _monitor_single_case(
 
     message_data = CaseMessageData(
         case_number=case.case_number,
-        rating=case.rating or "$$$",
+        rating=case.rating or RATING_UNKNOWN,
         title=case.title,
         auction=auction_fields,
         interest=InterestStats(
@@ -144,7 +145,7 @@ def _monitor_single_case(
             notion_data = NotionCaseData(
                 case_number=case.case_number,
                 title=case.title,
-                rating=case.rating or "$$$",
+                rating=case.rating or RATING_UNKNOWN,
                 item_number="확인중",
                 court=auction_fields.court,
                 address=auction_fields.address,
