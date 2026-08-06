@@ -1,0 +1,27 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.ruff_cache/
+.pytest_cache/
+
+# husik runtime data (state.json은 예외적으로 커밋 가능하게 별도 관리)
+data/inbox/
+data/tmp/
+data/outbox/
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
+# OS
+.DS_Store

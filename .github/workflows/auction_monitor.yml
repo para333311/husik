@@ -1,0 +1,67 @@
+name: Auction Monitor
+
+on:
+  schedule:
+    - cron: "30 22 * * *" # 매일 07:30 KST (UTC+9)
+  workflow_dispatch: {}
+
+concurrency:
+  group: husik-auction-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install python dependencies
+        run: pip install -e .
+
+      - name: Validate environment
+        env:
+          TELEGRAM_AUCTION_BOT_TOKEN: ${{ secrets.TELEGRAM_AUCTION_BOT_TOKEN }}
+          TELEGRAM_AUDIO_BOT_TOKEN: ${{ secrets.TELEGRAM_AUDIO_BOT_TOKEN }}
+          TELEGRAM_AUCTION_CHANNEL_ID: ${{ secrets.TELEGRAM_AUCTION_CHANNEL_ID }}
+          TELEGRAM_AUDIO_CHANNEL_ID: ${{ secrets.TELEGRAM_AUDIO_CHANNEL_ID }}
+          TELEGRAM_ALLOWED_USER_ID: ${{ secrets.TELEGRAM_ALLOWED_USER_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_AUCTION_DB_URL: ${{ secrets.NOTION_AUCTION_DB_URL }}
+          NOTION_HUSIK_DB_ID: ${{ secrets.NOTION_HUSIK_DB_ID }}
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+        run: python -m husik.cli validate-env
+
+      - name: Auction monitor
+        env:
+          TELEGRAM_AUCTION_BOT_TOKEN: ${{ secrets.TELEGRAM_AUCTION_BOT_TOKEN }}
+          TELEGRAM_AUCTION_CHANNEL_ID: ${{ secrets.TELEGRAM_AUCTION_CHANNEL_ID }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_AUCTION_DB_URL: ${{ secrets.NOTION_AUCTION_DB_URL }}
+          NOTION_HUSIK_DB_ID: ${{ secrets.NOTION_HUSIK_DB_ID }}
+          COURT_AUCTION_ENABLED: ${{ secrets.COURT_AUCTION_ENABLED }}
+          MADANGS_ENABLED: ${{ secrets.MADANGS_ENABLED }}
+        run: python -m husik.cli auction-monitor
+
+      - name: Commit state changes
+        run: |
+          git config user.name "husik-bot"
+          git config user.email "husik-bot@users.noreply.github.com"
+          git add data/state
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update state from auction monitor [skip ci]"
+            git push
+          else
+            echo "no state changes to commit"
+          fi
