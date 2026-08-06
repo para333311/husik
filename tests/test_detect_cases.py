@@ -1,11 +1,18 @@
 from pathlib import Path
 
-from husik.pdf.detect_cases import PageAnalysis, group_pages_into_cases
+from husik.pdf.detect_cases import PageAnalysis, group_pages_into_cases, split_uncertain_continuations
 
 RATING_UNKNOWN = "등급확인"
 
 
-def _page(page_no, case_numbers=None, rating=RATING_UNKNOWN, title_candidates=None, text=""):
+def _page(
+    page_no,
+    case_numbers=None,
+    rating=RATING_UNKNOWN,
+    title_candidates=None,
+    text="",
+    uncertain_marker=False,
+):
     return PageAnalysis(
         page_no=page_no,
         case_numbers=case_numbers or [],
@@ -13,6 +20,7 @@ def _page(page_no, case_numbers=None, rating=RATING_UNKNOWN, title_candidates=No
         title_candidates=title_candidates or [],
         raw_text=text,
         image_path=Path(f"/tmp/page_{page_no}.jpg"),
+        uncertain_marker=uncertain_marker,
     )
 
 
@@ -95,3 +103,38 @@ def test_rating_only_considered_near_case_start():
     assert records[0].rating == RATING_UNKNOWN
     # 등급을 못 찾았어도 사건은 여전히 존재해야 한다 (필터 아님).
     assert len(records) == 1
+
+
+def test_ordinary_continuation_page_without_marker_stays_attached():
+    """사진/설명만 있는 순수 continuation 페이지는 기존처럼 직전 사건에 남는다."""
+    pages = [
+        _page(1, case_numbers=["2025타경102095"], rating="$$$", title_candidates=["매물A"]),
+        _page(2, case_numbers=[], text="소재지: 서울시 동작구", uncertain_marker=False),
+    ]
+    records = group_pages_into_cases(pages)
+    records, review_pages = split_uncertain_continuations(records)
+    assert len(records) == 1
+    assert len(records[0].pages) == 2
+    assert review_pages == []
+
+
+def test_uncertain_marker_page_is_split_into_review_not_attached():
+    """사건번호는 못 뽑았지만 "20xx타경" 비슷한 조각이 있으면 직전 사건에 붙이지 않는다."""
+    pages = [
+        _page(1, case_numbers=["2025타경102095"], rating="$$$", title_candidates=["매물A"]),
+        _page(2, case_numbers=[], uncertain_marker=True),  # 다른 사건일 수 있음 (OCR 깨짐 의심)
+    ]
+    records = group_pages_into_cases(pages)
+    records, review_pages = split_uncertain_continuations(records)
+    assert len(records) == 1
+    assert [p.page_no for p in records[0].pages] == [1]
+    assert [p.page_no for p in review_pages] == [2]
+
+
+def test_first_page_of_case_is_never_moved_to_review_even_if_flagged():
+    pages = [_page(1, case_numbers=["2025타경102095"], rating="$$$", uncertain_marker=True)]
+    records = group_pages_into_cases(pages)
+    records, review_pages = split_uncertain_continuations(records)
+    assert len(records) == 1
+    assert len(records[0].pages) == 1
+    assert review_pages == []

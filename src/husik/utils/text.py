@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import re
 
-# 최소 1자리, 7자리 이상(예: 1234567)도 허용하도록 넉넉히 8자리까지 허용한다.
-CASE_NUMBER_PATTERN = re.compile(r"(\d{4})\s*타\s*경\s*(\d{1,8})")
+# 20xx + 타경 + 숫자 4~8자리. 공백은 연도/타/경/일련번호 사이 어디에 있어도 허용한다.
+CASE_NUMBER_PATTERN = re.compile(r"(20\d{2})\s*타\s*경\s*(\d{4,8})")
 DOLLAR_PATTERN = re.compile(r"\${1,10}")
+
+# "2025타경" 비슷한 글자는 있는데 뒤에 4자리 이상 숫자가 확실히 붙지 않는 경우
+# (OCR 깨짐 등으로 사건번호를 온전히 못 뽑은 경우) — 이 페이지를 직전 사건에
+# 무작정 이어붙이지 않고 "검토필요"로 분리하기 위한 신호로 쓴다.
+UNCERTAIN_CASE_MARKER_RE = re.compile(r"20\d{2}\s*타\s*경(?!\s*\d{4,8})")
 
 # --- 달러등급 분류 (필터가 아니라 분류 태그로만 사용) ---------------------------------
 # 순수 $/＄ 기호는 개수 그대로 인정한다 (기존 동작 유지, "추천 $$$" 형태도 매칭됨).
@@ -45,6 +50,15 @@ def extract_case_numbers(text: str) -> list[str]:
         if normalized not in seen:
             seen.append(normalized)
     return seen
+
+
+def looks_like_uncertain_case_marker(text: str) -> bool:
+    """확실한 사건번호는 못 뽑았지만 "20xx타경" 비슷한 조각이 있는지 확인한다.
+
+    사건번호가 전혀 없는 페이지를 직전 사건에 이어붙일지, "검토필요"로 분리할지
+    판단하는 신호로 쓴다 (호출자는 extract_case_numbers가 빈 리스트일 때만 호출할 것).
+    """
+    return bool(UNCERTAIN_CASE_MARKER_RE.search(text or ""))
 
 
 def extract_dollar_rating(text: str) -> str | None:

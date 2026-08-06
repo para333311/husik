@@ -2,8 +2,10 @@ from pathlib import Path
 
 from PIL import Image
 
+from husik.pdf.detect_cases import CaseRecord
+from husik.pdf.segment import ImageSegment
 from husik.telegram.client import TelegramError
-from husik.telegram.ingest import _send_image_chunk, send_photo_with_fallback
+from husik.telegram.ingest import _send_image_chunk, send_case_to_telegram, send_photo_with_fallback
 
 
 def _make_image(path: Path, size=(100, 100)) -> Path:
@@ -15,6 +17,7 @@ class FakeTelegramClient:
     def __init__(self):
         self.send_photo_calls = []
         self.send_media_group_calls = []
+        self.send_message_calls = []
         self.media_group_should_fail = True
         self.next_id = 1
 
@@ -22,6 +25,10 @@ class FakeTelegramClient:
         msg_id = self.next_id
         self.next_id += 1
         return msg_id
+
+    def send_message(self, chat_id, text, reply_to_message_id=None, parse_mode=None):
+        self.send_message_calls.append((chat_id, text, parse_mode))
+        return {"message_id": self._next()}
 
     def send_media_group(self, chat_id, photo_paths, captions=None, reply_to_message_id=None):
         self.send_media_group_calls.append((chat_id, list(photo_paths), reply_to_message_id))
@@ -74,3 +81,25 @@ def test_send_photo_with_fallback_returns_none_when_everything_fails(tmp_path):
     result = send_photo_with_fallback(client, "-100123", path, "1p", reply_to_message_id=None)
 
     assert result is None
+
+
+def test_send_case_to_telegram_uses_html_parse_mode(tmp_path):
+    client = FakeTelegramClient()
+    client.media_group_should_fail = False
+    image_path = _make_image(tmp_path / "p1.jpg")
+    record = CaseRecord(
+        case_number="2025타경102095",
+        rating="$$$",
+        title="사당 15 추천 $$$",
+        page_start=1,
+        page_end=1,
+        image_segments=[
+            ImageSegment(case_number="2025타경102095", page_no=1, image_path=image_path)
+        ],
+    )
+
+    send_case_to_telegram(client, "-100123", record, "<b>본문</b>")
+
+    assert len(client.send_message_calls) == 1
+    _, _, parse_mode = client.send_message_calls[0]
+    assert parse_mode == "HTML"

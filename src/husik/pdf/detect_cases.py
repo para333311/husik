@@ -1,7 +1,8 @@
 """사건번호 기준으로 페이지를 사건 단위로 묶는다.
 
 - 새 사건번호가 나오면 새 사건 시작.
-- 사건번호가 없는 페이지는 직전 사건에 포함.
+- 사건번호가 없는 페이지는 직전 사건에 포함 (단, 확실한 continuation 근거가 없으면
+  split_uncertain_continuations로 분리한다 — 아래 참고).
 - 같은 사건번호가 여러 페이지에 반복돼도 하나의 사건으로 유지.
 - 달러등급은 사건 시작 페이지 주변(RATING_LOOKAHEAD_PAGES)에서만 판단하고,
   이후 반복되는 달러 표시로 등급이 바뀌지 않는다.
@@ -9,14 +10,20 @@
 정책(2차): 달러등급은 더 이상 필터가 아니라 분류 태그다. 사건번호가 감지되면
 등급과 무관하게 무조건 CaseRecord로 등록된다. 등급을 못 찾으면 "등급확인",
 $/$$ 수준으로만 잡히면 "낮은등급"으로 분류한다 (utils.text.classify_rating 참고).
+
+정책(3차): 이미지는 더 이상 페이지 전체가 아니라 pdf.segment의 사건 단위 crop을
+쓴다 (CaseRecord.image_segments). 사건번호가 없는 continuation 페이지 중
+"20xx타경" 비슷한 조각만 있고 완전한 사건번호가 아닌 경우(uncertain_marker)는
+다른 사건일 가능성이 있으므로 직전 사건에 붙이지 않고 "검토필요"로 분리한다.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from husik.pdf.ocr import extract_page_text
+from husik.pdf.ocr import extract_page_text, openai_vision_case_numbers
 from husik.pdf.render import RenderedPage
+from husik.pdf.segment import REVIEW_LABEL, ImageSegment, segment_page
 from husik.utils.text import (
     RATING_3,
     RATING_4,
@@ -26,6 +33,7 @@ from husik.utils.text import (
     classify_rating,
     extract_case_numbers,
     extract_title_candidates,
+    looks_like_uncertain_case_marker,
     rating_to_count,
 )
 
@@ -42,6 +50,7 @@ class PageAnalysis:
     title_candidates: list[str]
     raw_text: str
     image_path: Path
+    uncertain_marker: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -61,6 +70,7 @@ class CaseRecord:
     page_start: int
     page_end: int
     pages: list[PageAnalysis] = field(default_factory=list)
+    image_segments: list[ImageSegment] = field(default_factory=list)
 
     @property
     def dollar_count(self) -> int:
@@ -68,18 +78,30 @@ class CaseRecord:
 
     @property
     def image_paths(self) -> list[Path]:
+        if self.image_segments:
+            return [seg.image_path for seg in self.image_segments]
         return [p.image_path for p in self.pages]
+
+    @property
+    def mixed_page_used(self) -> bool:
+        return any(seg.from_mixed_page for seg in self.image_segments)
 
 
 def analyze_page(rendered: RenderedPage, openai_api_key: str | None = None) -> PageAnalysis:
     text = extract_page_text(rendered.image_path, rendered.native_text, openai_api_key)
+    case_numbers = extract_case_numbers(text)
+    # 텍스트 기반으로 사건번호를 못 찾았으면 Vision에게 사건번호 목록만 JSON으로 재확인한다.
+    if not case_numbers and openai_api_key:
+        case_numbers = openai_vision_case_numbers(rendered.image_path, openai_api_key)
+    uncertain = looks_like_uncertain_case_marker(text) if not case_numbers else False
     return PageAnalysis(
         page_no=rendered.page_no,
-        case_numbers=extract_case_numbers(text),
+        case_numbers=case_numbers,
         rating=classify_rating(text),
         title_candidates=extract_title_candidates(text),
         raw_text=text,
         image_path=rendered.image_path,
+        uncertain_marker=uncertain,
     )
 
 
@@ -131,3 +153,134 @@ def group_pages_into_cases(pages: list[PageAnalysis]) -> list[CaseRecord]:
         record.title = _pick_title(record.pages, fallback=record.case_number)
 
     return records
+
+
+def split_uncertain_continuations(
+    records: list[CaseRecord],
+) -> tuple[list[CaseRecord], list[PageAnalysis]]:
+    """확실한 continuation 근거가 없는 페이지를 직전 사건에서 떼어 "검토필요"로 돌려준다.
+
+    각 사건의 첫 페이지(사건번호가 직접 발견된 페이지)는 항상 유지한다. 그 뒤에
+    붙은 continuation 페이지 중 사건번호는 없지만 "20xx타경" 비슷한 조각(uncertain_marker)이
+    있는 페이지만 다른 사건일 가능성이 있다고 보고 분리한다. 그 외 순수 continuation
+    페이지(사진/설명 등)는 기존처럼 직전 사건에 남는다.
+    """
+    review_pages: list[PageAnalysis] = []
+
+    for record in records:
+        kept: list[PageAnalysis] = []
+        for index, page in enumerate(record.pages):
+            is_first_page = index == 0
+            if not is_first_page and not page.case_numbers and page.uncertain_marker:
+                review_pages.append(page)
+                continue
+            kept.append(page)
+
+        if len(kept) != len(record.pages):
+            record.pages = kept
+            if kept:
+                record.page_start = kept[0].page_no
+                record.page_end = kept[-1].page_no
+                record.rating = _pick_rating_label(kept)
+                record.title = _pick_title(kept, fallback=record.case_number)
+
+    return records, review_pages
+
+
+def assign_image_segments(
+    records: list[CaseRecord],
+    rendered_pages: list[RenderedPage],
+    analyses: list[PageAnalysis],
+    work_dir: Path,
+) -> list[ImageSegment]:
+    """페이지별로 segment_page를 실행해 사건별 crop을 만들고 해당 CaseRecord에 배정한다.
+
+    한 페이지에 사건번호가 여러 개 있으면(다른 사건이 같은 페이지에서 시작하는 경우)
+    group_pages_into_cases는 첫 번째 사건번호만 그 페이지의 "소속"으로 보므로,
+    두 번째 이후 사건번호는 별도 CaseRecord가 없을 수 있다. 그런 사건번호는 여기서
+    즉석으로 새 CaseRecord를 만들어 이미지가 유실되거나 엉뚱한 사건에 섞이지 않게 한다.
+    bbox를 구할 수 없어 확신할 수 없는 경우는 "검토필요"로 분리해 반환한다 —
+    절대 임의의 사건에 붙이지 않는다.
+
+    사건번호가 없는 continuation 페이지(사진/설명 등)는 group_pages_into_cases +
+    split_uncertain_continuations가 이미 어느 사건에 속하는지(혹은 검토필요로 뺄지)
+    결정해뒀으므로, 그 결과(record.pages 소속 여부)를 그대로 따라 페이지 전체
+    이미지를 배정한다 — segment_page는 사건번호가 있는 페이지에만 적용된다.
+    """
+    by_case: dict[str, CaseRecord] = {r.case_number: r for r in records}
+    page_owner: dict[int, CaseRecord] = {}
+    for record in records:
+        for page in record.pages:
+            page_owner[page.page_no] = record
+
+    rendered_by_page = {r.page_no: r for r in rendered_pages}
+    review_segments: list[ImageSegment] = []
+
+    for analysis in analyses:
+        rendered = rendered_by_page.get(analysis.page_no)
+        if rendered is None:
+            continue
+
+        if not analysis.case_numbers:
+            owner = page_owner.get(analysis.page_no)
+            if owner is not None:
+                owner.image_segments.append(
+                    ImageSegment(
+                        case_number=owner.case_number,
+                        page_no=analysis.page_no,
+                        image_path=rendered.image_path,
+                    )
+                )
+            continue
+
+        for seg in segment_page(rendered, analysis.case_numbers, work_dir):
+            if seg.is_review or seg.case_number == REVIEW_LABEL:
+                review_segments.append(seg)
+                continue
+
+            record = by_case.get(seg.case_number)
+            if record is None:
+                record = CaseRecord(
+                    case_number=seg.case_number,
+                    rating=RATING_UNKNOWN,
+                    title=seg.case_number,
+                    page_start=seg.page_no,
+                    page_end=seg.page_no,
+                )
+                records.append(record)
+                by_case[seg.case_number] = record
+
+            record.image_segments.append(seg)
+            record.page_start = min(record.page_start, seg.page_no)
+            record.page_end = max(record.page_end, seg.page_no)
+
+    return review_segments
+
+
+@dataclass
+class AnalyzedPdf:
+    records: list[CaseRecord]
+    review_segments: list[ImageSegment] = field(default_factory=list)
+
+
+def analyze_pdf_pages(
+    rendered_pages: list[RenderedPage],
+    analyses: list[PageAnalysis],
+    work_dir: Path,
+) -> AnalyzedPdf:
+    """사건 묶기 + continuation 검증 + 사건 단위 이미지 분리를 한 번에 수행한다."""
+    records = group_pages_into_cases(analyses)
+    records, review_pages = split_uncertain_continuations(records)
+    review_segments = assign_image_segments(records, rendered_pages, analyses, work_dir)
+
+    for page in review_pages:
+        review_segments.append(
+            ImageSegment(
+                case_number=REVIEW_LABEL,
+                page_no=page.page_no,
+                image_path=page.image_path,
+                is_review=True,
+            )
+        )
+
+    return AnalyzedPdf(records=records, review_segments=review_segments)

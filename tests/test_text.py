@@ -9,6 +9,7 @@ from husik.utils.text import (
     extract_case_numbers,
     extract_dollar_rating,
     extract_title_candidates,
+    looks_like_uncertain_case_marker,
     normalize_case_number,
     rating_to_count,
 )
@@ -40,8 +41,28 @@ def test_extract_case_numbers_finds_all_spacing_variants():
 
 
 def test_extract_case_numbers_dedup_preserves_order():
-    text = "사건번호 2024타경12345 참고\n다시 2024 타경 12345\n2025타경1"
-    assert extract_case_numbers(text) == ["2024타경12345", "2025타경1"]
+    text = "사건번호 2024타경12345 참고\n다시 2024 타경 12345\n2025타경1234"
+    assert extract_case_numbers(text) == ["2024타경12345", "2025타경1234"]
+
+
+def test_extract_case_numbers_rejects_short_serial():
+    # 사건번호 일련번호는 4~8자리만 인정한다.
+    assert extract_case_numbers("2025타경1") == []
+    assert extract_case_numbers("2025타경12") == []
+    assert extract_case_numbers("2025타경123") == []
+
+
+def test_looks_like_uncertain_case_marker_true_when_digits_missing():
+    assert looks_like_uncertain_case_marker("2025타경") is True
+    assert looks_like_uncertain_case_marker("2025 타 경") is True
+
+
+def test_looks_like_uncertain_case_marker_false_when_no_marker_at_all():
+    assert looks_like_uncertain_case_marker("소재지: 서울시 강남구") is False
+
+
+def test_looks_like_uncertain_case_marker_false_when_full_case_number_present():
+    assert looks_like_uncertain_case_marker("2025타경102095") is False
 
 
 def test_extract_case_numbers_empty():

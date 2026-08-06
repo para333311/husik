@@ -4,6 +4,7 @@ adapter 실패는 best-effort로 흡수하며, 실패해도 전체 auction-monit
 """
 from __future__ import annotations
 
+import html
 import logging
 from dataclasses import asdict
 
@@ -128,10 +129,12 @@ def _monitor_case_auction(
             if award_new:
                 updated_text = build_award_update(message_data, existing_message="낙찰결과 반영 전 상태")
             else:
-                prev_status = previous.get("status", "확인중")
-                note = f"상태: {prev_status} -> {current.status}"
+                prev_status = html.escape(previous.get("status", "확인중"))
+                note = f"상태: {prev_status} -> {html.escape(current.status or '확인중')}"
                 updated_text = build_event_update("상태변경", message_data, existing_message=note)
-            telegram.edit_message_text(case.channel_id, case.representative_message_id, updated_text)
+            telegram.edit_message_text(
+                case.channel_id, case.representative_message_id, updated_text, parse_mode="HTML"
+            )
         except Exception:
             logger.exception("failed to edit telegram message for %s", case.case_number)
 

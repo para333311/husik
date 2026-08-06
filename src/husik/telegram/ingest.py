@@ -19,12 +19,14 @@ from husik.notion.client import NotionClient
 from husik.notion.schema import resolve_database_id
 from husik.notion.upsert import NotionCaseData, upsert_case_page
 from husik.pdf.detect_cases import (
+    AnalyzedPdf,
     CaseRecord,
     PageAnalysis,
     analyze_page,
-    group_pages_into_cases,
+    analyze_pdf_pages,
 )
 from husik.pdf.render import render_pdf_to_images
+from husik.pdf.segment import REVIEW_LABEL, ImageSegment
 from husik.state.store import CaseState, StateStore
 from husik.telegram.client import TelegramClient, TelegramError
 from husik.telegram.commands import handle_bot_command
@@ -104,6 +106,8 @@ class CaseProcessResult:
     page_end: int
     processed: bool
     reason: str = ""
+    page_image_map: str = ""
+    mixed_page: bool = False
 
 
 @dataclass
@@ -137,10 +141,20 @@ def hash_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def analyze_pdf(pdf_path: Path, work_dir: Path, openai_api_key: str | None) -> list[CaseRecord]:
+def analyze_pdf(pdf_path: Path, work_dir: Path, openai_api_key: str | None) -> AnalyzedPdf:
     rendered_pages = render_pdf_to_images(pdf_path, work_dir)
     analyses: list[PageAnalysis] = [analyze_page(p, openai_api_key) for p in rendered_pages]
-    return group_pages_into_cases(analyses)
+    return analyze_pdf_pages(rendered_pages, analyses, work_dir)
+
+
+def _format_page_image_map(record: CaseRecord) -> str:
+    """디버그 출력용: "p1 crop1, p2 crop1" 형태로 이 사건이 어떤 페이지/crop에서 왔는지 보여준다."""
+    counts: dict[int, int] = {}
+    parts: list[str] = []
+    for seg in record.image_segments:
+        counts[seg.page_no] = counts.get(seg.page_no, 0) + 1
+        parts.append(f"p{seg.page_no} crop{counts[seg.page_no]}")
+    return ", ".join(parts)
 
 
 def dry_run_report(records: list[CaseRecord]) -> list[CaseProcessResult]:
@@ -156,6 +170,8 @@ def dry_run_report(records: list[CaseRecord]) -> list[CaseProcessResult]:
                 page_end=r.page_end,
                 processed=True,
                 reason="",
+                page_image_map=_format_page_image_map(r),
+                mixed_page=r.mixed_page_used,
             )
         )
     return results
@@ -273,18 +289,19 @@ def send_case_to_telegram(
     telegram: TelegramClient, channel_id: str, record: CaseRecord, message_text: str
 ) -> _CaseTelegramResult:
     try:
-        sent = telegram.send_message(channel_id, message_text)
+        sent = telegram.send_message(channel_id, message_text, parse_mode="HTML")
     except TelegramError as exc:
         raise ChannelSendError(str(exc)) from exc
     rep_id = sent["message_id"]
 
     image_ids: list[int] = []
     images_failed = 0
-    paths = record.image_paths
-    for start in range(0, len(paths), MAX_ALBUM_SIZE):
-        chunk = paths[start : start + MAX_ALBUM_SIZE]
-        captions = [build_page_caption(p.page_no) for p in record.pages[start : start + MAX_ALBUM_SIZE]]
-        sent_ids, failed = _send_image_chunk(telegram, channel_id, chunk, captions, rep_id)
+    segments = record.image_segments
+    for start in range(0, len(segments), MAX_ALBUM_SIZE):
+        chunk_segments = segments[start : start + MAX_ALBUM_SIZE]
+        chunk_paths = [seg.image_path for seg in chunk_segments]
+        captions = [build_page_caption(seg.page_no) for seg in chunk_segments]
+        sent_ids, failed = _send_image_chunk(telegram, channel_id, chunk_paths, captions, rep_id)
         image_ids.extend(sent_ids)
         images_failed += failed
     return _CaseTelegramResult(
@@ -438,7 +455,8 @@ def process_pdf_and_send(
         rendered_pages = render_pdf_to_images(pdf_path, work_dir)
         stats.pages_rendered += len(rendered_pages)
         analyses = [analyze_page(p, config.openai_api_key) for p in rendered_pages]
-        records = group_pages_into_cases(analyses)
+        analyzed = analyze_pdf_pages(rendered_pages, analyses, work_dir)
+        records = analyzed.records
         result.detected_cases = len(records)
         stats.detected_cases += len(records)
 
@@ -487,6 +505,14 @@ def process_pdf_and_send(
                 else:
                     result.any_notion_failed = True
 
+        # 확신이 낮아 특정 사건에 못 붙인 이미지는 절대 섞지 않고 "검토필요"로 따로 보낸다.
+        if analyzed.review_segments and not result.channel_send_failed:
+            try:
+                _send_review_segments(telegram, config.telegram_auction_channel_id, analyzed.review_segments)
+            except Exception:
+                logger.exception("failed to send review segments")
+                stats.errors_count += 1
+
         stats.sent_telegram_cases += result.cases_sent
         stats.sent_telegram_images += result.images_sent
         stats.notion_upserted += result.notion_upserted
@@ -495,28 +521,78 @@ def process_pdf_and_send(
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _send_review_segments(
+    telegram: TelegramClient, channel_id: str, segments: list[ImageSegment]
+) -> None:
+    """사건 구분이 불확실한 이미지는 특정 사건에 붙이지 않고 별도 메시지로 보낸다.
+
+    다른 사건 이미지와 절대 섞이면 안 되므로, 확신이 없을 땐 이렇게 따로 보내는
+    쪽을 택한다 (요구사항: "확신이 낮으면 차라리 해당 이미지를 검토필요로 따로 보내세요").
+    """
+    pages = sorted({seg.page_no for seg in segments})
+    page_list = ", ".join(f"p{p}" for p in pages)
+    header = f"[검토필요] 사건 구분이 불확실한 페이지 ({page_list})"
+    sent = telegram.send_message(channel_id, header, parse_mode="HTML")
+    rep_id = sent["message_id"]
+
+    paths = [seg.image_path for seg in segments]
+    captions = [build_page_caption(seg.page_no) for seg in segments]
+    for start in range(0, len(paths), MAX_ALBUM_SIZE):
+        chunk_paths = paths[start : start + MAX_ALBUM_SIZE]
+        chunk_captions = captions[start : start + MAX_ALBUM_SIZE]
+        _send_image_chunk(telegram, channel_id, chunk_paths, chunk_captions, rep_id)
+
+
+@dataclass
+class DryRunReport:
+    results: list[CaseProcessResult]
+    review_page_count: int = 0
+
+
+def _save_crops(analyzed: AnalyzedPdf, dest_dir: Path) -> None:
+    """--save-crops 디버그 옵션: 사건별/검토필요별 crop 이미지를 지정된 폴더에 복사한다."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for record in analyzed.records:
+        case_dir = dest_dir / record.case_number
+        case_dir.mkdir(parents=True, exist_ok=True)
+        for seg in record.image_segments:
+            shutil.copy2(seg.image_path, case_dir / seg.image_path.name)
+
+    if analyzed.review_segments:
+        review_dir = dest_dir / REVIEW_LABEL
+        review_dir.mkdir(parents=True, exist_ok=True)
+        for seg in analyzed.review_segments:
+            shutil.copy2(seg.image_path, review_dir / seg.image_path.name)
+
+
 def process_pdf(
     pdf_path: Path,
     config: Config,
     state: StateStore,
     send: bool,
     tmp_root: Path,
-) -> list[CaseProcessResult]:
+    save_crops_dir: Path | None = None,
+) -> DryRunReport:
     """CLI process-local-pdf 용. send=True면 실제 반영까지 수행한다."""
     work_dir = tmp_root / f"work_{hash_file(pdf_path)[:12]}"
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        records = analyze_pdf(pdf_path, work_dir, config.openai_api_key)
-        results = dry_run_report(records)
+        analyzed = analyze_pdf(pdf_path, work_dir, config.openai_api_key)
+        results = dry_run_report(analyzed.records)
+        review_count = len(analyzed.review_segments)
+
+        if save_crops_dir is not None:
+            _save_crops(analyzed, save_crops_dir)
+
         if not send:
-            return results
+            return DryRunReport(results=results, review_page_count=review_count)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
     stats = IngestStats()
     process_pdf_and_send(pdf_path, config, state, tmp_root, stats)
     stats.log_summary()
-    return results
+    return DryRunReport(results=results, review_page_count=review_count)
 
 
 def poll_and_ingest(config: Config, state: StateStore) -> IngestStats:

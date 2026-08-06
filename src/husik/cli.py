@@ -57,13 +57,26 @@ def cmd_process_local_pdf(args: argparse.Namespace) -> int:
 
     tmp_root = config.tmp_dir
     tmp_root.mkdir(parents=True, exist_ok=True)
-    results = process_pdf(pdf_path, config, state, send=args.send, tmp_root=tmp_root)
+    save_crops_dir = Path(args.save_crops) if args.save_crops else None
+    report = process_pdf(
+        pdf_path, config, state, send=args.send, tmp_root=tmp_root, save_crops_dir=save_crops_dir
+    )
 
-    print(f"{'사건번호':<16}{'달러등급':<10}{'제목':<30}{'페이지범위':<12}{'처리 여부'}")
-    for r in results:
+    header = f"{'사건번호':<16}{'달러등급':<10}{'제목':<24}{'페이지범위':<12}{'처리 여부':<8}{'혼합페이지'}"
+    print(header)
+    for r in report.results:
         status = "처리" if r.processed else (f"버림({r.reason})" if r.reason else "버림")
         page_range = f"{r.page_start}-{r.page_end}p"
-        print(f"{r.case_number:<16}{r.rating:<10}{r.title[:28]:<30}{page_range:<12}{status}")
+        mixed = "true" if r.mixed_page else "false"
+        print(f"{r.case_number:<16}{r.rating:<10}{r.title[:22]:<24}{page_range:<12}{status:<8}{mixed}")
+        if args.debug_layout and r.page_image_map:
+            print(f"  페이지/이미지: {r.page_image_map}")
+
+    if report.review_page_count:
+        print(f"\n검토필요(사건 구분 불확실): {report.review_page_count}장 (다른 사건에 섞지 않고 별도 전송)")
+
+    if save_crops_dir is not None:
+        print(f"\ncrop 이미지 저장 위치: {save_crops_dir}")
     return 0
 
 
@@ -213,6 +226,12 @@ def build_parser() -> argparse.ArgumentParser:
     group = p.add_mutually_exclusive_group()
     group.add_argument("--dry-run", action="store_true", dest="dry_run", help="전송 없이 감지 결과만 출력")
     group.add_argument("--send", action="store_true", dest="send", help="Telegram/Notion에 실제 전송")
+    p.add_argument(
+        "--debug-layout", action="store_true", help="사건별 페이지/crop 매핑을 추가로 출력"
+    )
+    p.add_argument(
+        "--save-crops", metavar="DIR", default=None, help="사건별/검토필요 crop 이미지를 지정 폴더에 저장"
+    )
     p.set_defaults(func=cmd_process_local_pdf, send=False)
 
     sub.add_parser("blog-monitor", help="일일 블로그 모니터링").set_defaults(func=cmd_blog_monitor)

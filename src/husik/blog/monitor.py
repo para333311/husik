@@ -1,6 +1,7 @@
 """사건별 블로그 신규 언급 모니터링 (관심도 점수화 없이 숫자만 표시)."""
 from __future__ import annotations
 
+import html
 import logging
 import re
 from datetime import date, datetime
@@ -128,10 +129,12 @@ def _monitor_single_case(
 
     if telegram and case.representative_message_id and case.channel_id:
         try:
-            new_links_text = "\n".join(f"- {p.link}" for p in new_posts)
+            new_links_text = "\n".join(f"- {html.escape(p.link)}" for p in new_posts)
             existing_note = f"신규 블로그 {len(new_posts)}건 발견\n{new_links_text}"
             updated_text = build_event_update("블로그업데이트", message_data, existing_message=existing_note)
-            telegram.edit_message_text(case.channel_id, case.representative_message_id, updated_text)
+            telegram.edit_message_text(
+                case.channel_id, case.representative_message_id, updated_text, parse_mode="HTML"
+            )
         except Exception:
             logger.exception("failed to edit telegram message for %s", case.case_number)
 

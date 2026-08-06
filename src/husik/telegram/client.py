@@ -106,23 +106,31 @@ class TelegramClient:
         return dest
 
     def send_message(
-        self, chat_id: str | int, text: str, reply_to_message_id: int | None = None
+        self,
+        chat_id: str | int,
+        text: str,
+        reply_to_message_id: int | None = None,
+        parse_mode: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
         if reply_to_message_id:
             payload["reply_to_message_id"] = reply_to_message_id
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         return self._call("sendMessage", payload)
 
-    def edit_message_text(self, chat_id: str | int, message_id: int, text: str) -> dict[str, Any]:
-        return self._call(
-            "editMessageText",
-            {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": text,
-                "disable_web_page_preview": True,
-            },
-        )
+    def edit_message_text(
+        self, chat_id: str | int, message_id: int, text: str, parse_mode: str | None = None
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        return self._call("editMessageText", payload)
 
     def send_photo(
         self,
