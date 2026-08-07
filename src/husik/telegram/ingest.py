@@ -39,7 +39,7 @@ from husik.telegram.templates import (
     build_page_caption,
     build_representative_message,
 )
-from husik.utils.text import RATING_UNKNOWN
+from husik.utils.text import RATING_UNKNOWN, normalize_sale_date
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +105,7 @@ class CaseProcessResult:
     rating: str
     title: str
     sale_date: date | None
+    status: str | None
     page_start: int
     page_end: int
     image_count: int
@@ -113,6 +114,7 @@ class CaseProcessResult:
     page_image_map: str = ""
     image_refs: list[str] = field(default_factory=list)
     mixed_page: bool = False
+    processing_mode: str = "page/full"
 
 
 @dataclass
@@ -174,12 +176,14 @@ def dry_run_report(records: list[CaseRecord]) -> list[CaseProcessResult]:
                 sale_date=r.sale_date,
                 page_start=r.page_start,
                 page_end=r.page_end,
+                status=r.status,
                 image_count=len(r.image_segments),
                 processed=True,
                 reason="",
                 page_image_map=", ".join(_format_page_image_refs(r)),
                 image_refs=_format_page_image_refs(r),
                 mixed_page=r.mixed_page_used,
+                processing_mode="page/mixed-split" if r.mixed_page_used else "page/full",
             )
         )
     return results
@@ -351,7 +355,8 @@ def _to_message_data(record: CaseRecord, auction_info, interest: InterestStats) 
         case_number=record.case_number,
         rating=record.rating or RATING_UNKNOWN,
         title=record.title,
-        sale_date_text=record.sale_date,
+        sale_date_text=normalize_sale_date(record.sale_date),
+        status_text=record.status,
         auction=auction,
         interest=interest,
         image_count=len(record.image_segments),

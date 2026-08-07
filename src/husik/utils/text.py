@@ -30,8 +30,14 @@ RATING_3 = "$$$"
 RATING_LOW = "낮은등급"
 RATING_UNKNOWN = "등급확인"
 
-SALE_DATE_LABEL_RE = re.compile(r"매각\s*기\s*일\s*[:：]?\s*", re.IGNORECASE)
+SALE_DATE_LABEL_RE = re.compile(r"매각\s*(?:기\s*일|일)\s*[:：]?\s*", re.IGNORECASE)
 SALE_DATE_RE = re.compile(r"(20\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})")
+STATUS_LINE_RE = re.compile(r"(?:진행\s*상태|상태)\s*[:：]?\s*(낙찰|유찰|변경|취하|기각|진행중|매각)")
+STATUS_TOKEN_RE = re.compile(r"\b(낙찰|유찰|변경|취하|기각|진행중|매각)\b")
+TITLE_GRADE_RE = re.compile(r"(?:\${2,10}\+?|[Ss]{3,10}|\$\$\+)")
+TITLE_BLOCKED_TAG_RE = re.compile(
+    r"\[(?:투기과열지구(?:\s*/\s*조정대상지역)?|조정대상지역|토지거래허가구역(?:\s*/\s*조정대상지역)?)\]"
+)
 
 _RATING_COUNTS = {RATING_5: 5, RATING_4: 4, RATING_3: 3, RATING_LOW: 0, RATING_UNKNOWN: 0}
 
@@ -128,11 +134,20 @@ def rating_to_count(rating: str | None) -> int:
     return _RATING_COUNTS.get(rating or "", 0)
 
 
+def _clean_title_line(line: str) -> str:
+    cleaned = TITLE_BLOCKED_TAG_RE.sub("", line)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def has_title_grade_marker(text: str) -> bool:
+    return bool(TITLE_GRADE_RE.search(text or ""))
+
+
 def extract_title_candidates(text: str, max_candidates: int = 5) -> list[str]:
     """사건번호/달러표시만 있는 줄을 제외한 제목 후보 줄들을 추출한다."""
     candidates: list[str] = []
     for line in (text or "").splitlines():
-        stripped = line.strip()
+        stripped = _clean_title_line(line.strip())
         if not stripped or len(stripped) < 2:
             continue
         if "매수맛집" in stripped:
@@ -168,7 +183,7 @@ def extract_sale_date(text: str) -> str | None:
     """"매각기일" 주변 날짜를 추출해 `YYYY.M.D` 형식으로 정규화한다."""
     value = text or ""
     for match in SALE_DATE_LABEL_RE.finditer(value):
-        window = value[match.end() : match.end() + 60]
+        window = value[match.start() : match.end() + 80]
         date_match = SALE_DATE_RE.search(window)
         if date_match:
             return normalize_sale_date(tuple(int(x) for x in date_match.groups()))
@@ -179,4 +194,23 @@ def extract_sale_date(text: str) -> str | None:
             if date_match:
                 return normalize_sale_date(tuple(int(x) for x in date_match.groups()))
 
+    return None
+
+
+def extract_progress_status(text: str) -> str | None:
+    value = text or ""
+
+    line_match = STATUS_LINE_RE.search(value)
+    if line_match:
+        return line_match.group(1)
+
+    for line in value.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if len(stripped) > 15:
+            continue
+        token = STATUS_TOKEN_RE.fullmatch(stripped)
+        if token:
+            return token.group(1)
     return None

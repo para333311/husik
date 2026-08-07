@@ -67,11 +67,13 @@ def cmd_process_local_pdf(args: argparse.Namespace) -> int:
         print(f"제목: {r.title}")
         if r.sale_date is not None:
             sale_date = f"{r.sale_date.year}.{r.sale_date.month}.{r.sale_date.day}"
-        else:
-            sale_date = ""
-        print(f"매각기일: {sale_date}")
-        print(f"이미지: {r.image_count}장")
-        if args.debug_layout:
+            print(f"매각기일: {sale_date}")
+        if r.status:
+            print(f"상태: {r.status}")
+        print(f"페이지범위: {r.page_start}-{r.page_end}")
+        print(f"이미지수: {r.image_count}")
+        print(f"처리방식: {r.processing_mode}")
+        if args.debug_layout and r.image_refs:
             print("이미지범위:")
             for ref in r.image_refs:
                 print(f"- {ref}")

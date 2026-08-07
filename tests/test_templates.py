@@ -14,7 +14,7 @@ def test_representative_message_simple_format():
         case_number="2025타경1708",
         rating="$$$",
         title="효창공원 시프트 SSS",
-        auction=AuctionFields(sale_date=date(2026, 5, 19)),
+        auction=AuctionFields(sale_date=date(2026, 5, 19), status="낙찰"),
         image_count=3,
     )
 
@@ -24,14 +24,13 @@ def test_representative_message_simple_format():
         [
             "[2025타경1708]",
             "효창공원 시프트 SSS",
-            "ㅇ 매각기일 : 2026.5.19",
-            "ㅇ 상태 :",
-            "ㅇ 이미지 3장",
+            "· 매각기일 2026.5.19",
+            "· 낙찰",
         ]
     )
 
 
-def test_representative_message_keeps_sale_date_line_even_when_missing():
+def test_representative_message_hides_sale_date_when_missing():
     data = CaseMessageData(
         case_number="2025타경1708",
         rating="$$$",
@@ -40,7 +39,20 @@ def test_representative_message_keeps_sale_date_line_even_when_missing():
     )
     text = build_representative_message(data)
 
-    assert "ㅇ 매각기일 : " in text
+    assert "매각기일" not in text
+
+
+def test_representative_message_hides_status_when_unknown():
+    data = CaseMessageData(
+        case_number="2025타경1708",
+        rating="$$$",
+        title="효창공원 시프트 SSS",
+        auction=AuctionFields(status="확인중"),
+    )
+    text = build_representative_message(data)
+
+    assert "·" not in text
+    assert "상태" not in text
 
 
 def test_representative_message_hides_interest_link_blog_notion_texts():
@@ -68,6 +80,9 @@ def test_representative_message_hides_interest_link_blog_notion_texts():
         "아래 첨부 이미지",
         "링크:",
         "업데이트:",
+        "이미지",
+        "상태 :",
+        "ㅇ ",
     ]
     for word in forbidden:
         assert word not in text
@@ -79,7 +94,7 @@ def test_representative_message_omits_title_when_missing():
     text = build_representative_message(data)
 
     assert text.splitlines()[0] == "[2025타경1708]"
-    assert "효창공원" not in text
+    assert len(text.splitlines()) == 1
 
 
 def test_event_update_preserves_event_prefix_and_existing_message():
@@ -100,9 +115,12 @@ def test_award_update_uses_same_minimal_body():
         case_number="2025타경1708",
         rating="$$$",
         title="효창공원 시프트 SSS",
-        image_count=4,
+        sale_date_text="2026.5.19",
+        status_text="유찰",
     )
     updated = build_award_update(data, existing_message="이전 내용")
 
-    assert "ㅇ 상태 :" in updated
-    assert "ㅇ 이미지 4장" in updated
+    assert "· 매각기일 2026.5.19" in updated
+    assert "· 유찰" in updated
+    assert "상태 :" not in updated
+    assert "이미지" not in updated

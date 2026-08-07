@@ -84,7 +84,7 @@ def test_case_number_without_rating_is_still_processed_and_gets_its_own_images(t
     by_case = {r.case_number: r for r in report.results}
     assert by_case["2024타경12345"].rating == "$$$$"
     assert by_case["2024타경12345"].processed is True
-    assert by_case["2024타경12345"].image_count >= 1
+    assert by_case["2024타경12345"].image_count == 1
     # 등급이 전혀 안 잡혀도(등급확인) 여전히 전송 대상이어야 한다.
     assert by_case["2024타경9999"].rating == "등급확인"
     assert by_case["2024타경9999"].processed is True
@@ -92,6 +92,36 @@ def test_case_number_without_rating_is_still_processed_and_gets_its_own_images(t
     assert "p1" in by_case["2024타경12345"].page_image_map
     assert "p3" in by_case["2024타경9999"].page_image_map
     assert "p3" not in by_case["2024타경12345"].page_image_map
+
+
+def test_single_case_multiple_pages_are_merged_into_one_image(tmp_path):
+    pdf_path = tmp_path / "single_case_multi_page.pdf"
+    doc = fitz.open()
+    font = fitz.Font("korea")
+
+    page1 = doc.new_page()
+    page1.insert_font(fontname="F0", fontbuffer=font.buffer)
+    page1.insert_text((50, 80), "상계3 $$+", fontsize=14, fontname="F0")
+    page1.insert_text((50, 105), "2025타경13320", fontsize=14, fontname="F0")
+
+    page2 = doc.new_page()
+    page2.insert_font(fontname="F0", fontbuffer=font.buffer)
+    page2.insert_text((50, 80), "추가 설명 페이지", fontsize=14, fontname="F0")
+
+    doc.save(str(pdf_path))
+    doc.close()
+
+    config = _make_config(tmp_path)
+    state = StateStore(config.state_dir)
+
+    report = process_pdf(pdf_path, config, state, send=False, tmp_root=config.tmp_dir)
+
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.case_number == "2025타경13320"
+    assert result.page_start == 1 and result.page_end == 2
+    assert result.image_count == 1
+    assert result.processing_mode == "page/full"
 
 
 def test_sale_date_is_extracted_into_case_record(tmp_path):

@@ -40,6 +40,7 @@ class CaseMessageData:
     rating: str
     title: str
     sale_date_text: str | None = None
+    status_text: str | None = None
     item_number: str = UNKNOWN
     auction: AuctionFields = field(default_factory=AuctionFields)
     interest: InterestStats = field(default_factory=InterestStats)
@@ -76,15 +77,22 @@ def build_header(data: CaseMessageData, event_tag: str | None = None) -> str:
     return f"[{event_tag}] {base}" if event_tag else base
 
 
+ALLOWED_STATUS = {"낙찰", "유찰", "변경", "취하", "기각", "진행중", "매각"}
+
+
 def build_body(data: CaseMessageData, update_log: list[str] | None = None) -> str:
     lines: list[str] = []
     if data.title and data.title != data.case_number:
         lines.append(data.title)
 
     sale_date = data.sale_date_text or format_compact_date(data.auction.sale_date)
-    lines.append(f"ㅇ 매각기일 : {sale_date}")
-    lines.append("ㅇ 상태 :")
-    lines.append(f"ㅇ 이미지 {data.image_count}장")
+    if sale_date:
+        lines.append(f"· 매각기일 {sale_date}")
+
+    status = (data.status_text or data.auction.status or "").strip()
+    if status in ALLOWED_STATUS:
+        lines.append(f"· {status}")
+
     return "\n".join(lines)
 
 
@@ -99,7 +107,8 @@ def truncate_message(text: str, limit: int = MESSAGE_LIMIT) -> str:
 
 
 def build_representative_message(data: CaseMessageData) -> str:
-    text = build_header(data) + "\n" + build_body(data)
+    body = build_body(data)
+    text = build_header(data) if not body else build_header(data) + "\n" + body
     return truncate_message(text)
 
 

@@ -1,14 +1,9 @@
-"""페이지를 사건번호 위치 기준으로 나눠 사건별 crop 이미지를 만든다.
+"""페이지 내 사건표 시작점을 기준으로 필요한 경우에만 크게 세로 분할한다.
 
-한 페이지 안에 사건번호가 여러 개 있을 때 페이지 전체 이미지를 사건 하나에
-붙이면 다른 사건의 이미지가 섞여 들어간다. 이를 막기 위해 사건번호가 등장하는
-줄의 y좌표를 기준으로 페이지를 세로로 나눠, 사건별로 그 구간만 crop한다.
-
-레이아웃(줄 bbox)은 다음 순서로 확보한다:
-1. PDF 텍스트 레이어가 있으면 render.py가 이미 계산해둔 native_lines 사용.
-2. 없으면(이미지 PDF) tesseract의 image_to_data로 OCR bbox를 뽑는다.
-3. 그래도 못 구하면 whole-page fallback으로 처리하되, 한 페이지에 사건번호가
-   2개 이상이면 확신할 수 없으므로 "검토필요"로 분리해 보낸다 (절대 섞지 않음).
+정책:
+- 기본은 페이지 전체를 한 사건 이미지로 사용한다.
+- 한 페이지에 좌측 영역 사건번호 시작점이 2개 이상일 때만 표 단위 세로 분할한다.
+- 세부 요소(사진/지도/제목) 단위의 미세 crop은 하지 않는다.
 """
 from __future__ import annotations
 
@@ -24,31 +19,56 @@ from husik.utils.text import extract_case_numbers, looks_like_uncertain_case_mar
 logger = logging.getLogger(__name__)
 
 REVIEW_LABEL = "검토필요"
+LEFT_MARKER_X_RATIO = 0.45
+MAX_MARKER_LINE_LENGTH = 40
 
 
 @dataclass
 class CaseMarker:
     case_number: str
     y_top: float
+    x_left: float
 
 
 @dataclass
 class PageLayout:
+    image_width: int
     image_height: int
     markers: list[CaseMarker] = field(default_factory=list)
     uncertain_marker_found: bool = False
 
 
-def _layout_from_lines(lines: list[NativeLine], image_height: int) -> PageLayout:
+def _looks_like_table_start_line(text: str) -> bool:
+    # 본문 문장 속 과거 사건번호 오탐을 줄이기 위해 너무 긴 라인은 제외한다.
+    return len((text or "").strip()) <= MAX_MARKER_LINE_LENGTH
+
+
+def _layout_from_lines(lines: list[NativeLine], image_width: int, image_height: int) -> PageLayout:
     markers: list[CaseMarker] = []
     uncertain = False
+    marker_keys: set[tuple[str, int]] = set()
+
     for line in lines:
+        if line.x_left > image_width * LEFT_MARKER_X_RATIO:
+            continue
+
         found = extract_case_numbers(line.text)
-        if found:
-            markers.append(CaseMarker(case_number=found[0], y_top=line.y_top))
+        if found and _looks_like_table_start_line(line.text):
+            key = (found[0], int(line.y_top))
+            if key in marker_keys:
+                continue
+            marker_keys.add(key)
+            markers.append(CaseMarker(case_number=found[0], y_top=line.y_top, x_left=line.x_left))
         elif looks_like_uncertain_case_marker(line.text):
             uncertain = True
-    return PageLayout(image_height=image_height, markers=markers, uncertain_marker_found=uncertain)
+
+    markers.sort(key=lambda m: m.y_top)
+    return PageLayout(
+        image_width=image_width,
+        image_height=image_height,
+        markers=markers,
+        uncertain_marker_found=uncertain,
+    )
 
 
 def _tesseract_layout(image_path: Path) -> PageLayout | None:
@@ -60,7 +80,7 @@ def _tesseract_layout(image_path: Path) -> PageLayout | None:
 
     try:
         with Image.open(image_path) as img:
-            height = img.height
+            width, height = img.size
             data = pytesseract.image_to_data(img, lang="kor+eng", output_type=Output.DICT)
     except Exception as exc:  # pragma: no cover - depends on system tesseract install
         logger.warning("tesseract layout detection failed for %s: %s", image_path.name, exc)
@@ -73,24 +93,41 @@ def _tesseract_layout(image_path: Path) -> PageLayout | None:
         if not word:
             continue
         key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        left = data["left"][i]
         top = data["top"][i]
+        right = left + data["width"][i]
         bottom = top + data["height"][i]
-        entry = lines.setdefault(key, {"words": [], "y_top": top, "y_bottom": bottom})
+        entry = lines.setdefault(
+            key,
+            {"words": [], "x_left": left, "x_right": right, "y_top": top, "y_bottom": bottom},
+        )
         entry["words"].append(word)
+        entry["x_left"] = min(entry["x_left"], left)
+        entry["x_right"] = max(entry["x_right"], right)
         entry["y_top"] = min(entry["y_top"], top)
         entry["y_bottom"] = max(entry["y_bottom"], bottom)
 
     native_lines = [
-        NativeLine(text=" ".join(v["words"]), y_top=v["y_top"], y_bottom=v["y_bottom"])
+        NativeLine(
+            text=" ".join(v["words"]),
+            y_top=v["y_top"],
+            y_bottom=v["y_bottom"],
+            x_left=v["x_left"],
+            x_right=v["x_right"],
+        )
         for v in sorted(lines.values(), key=lambda v: v["y_top"])
     ]
-    return _layout_from_lines(native_lines, image_height=height)
+    return _layout_from_lines(native_lines, image_width=width, image_height=height)
 
 
 def detect_page_layout(rendered: RenderedPage) -> PageLayout | None:
     """레이아웃(사건번호별 y좌표)을 확보한다. 완전히 실패하면 None을 반환한다."""
     if rendered.native_lines:
-        return _layout_from_lines(rendered.native_lines, image_height=rendered.image_height)
+        return _layout_from_lines(
+            rendered.native_lines,
+            image_width=rendered.image_width,
+            image_height=rendered.image_height,
+        )
     return _tesseract_layout(rendered.image_path)
 
 
@@ -118,12 +155,12 @@ def segment_page(
     fallback_case_numbers: list[str],
     work_dir: Path,
 ) -> list[ImageSegment]:
-    """페이지 하나를 사건번호 기준 구간으로 나눠 crop 이미지 목록을 만든다.
+    """한 페이지를 사건표 시작 y 기준으로 크게 분할한다.
 
-    - 사건번호가 없으면 빈 리스트를 반환한다 (continuation 여부는 호출자가 판단).
-    - 사건번호가 1개면 페이지 전체를 그 사건에 배정한다 (crop 불필요).
-    - 사건번호가 2개 이상이고 bbox를 구했으면 각 사건번호 줄 y좌표로 나눠 crop한다.
-    - 사건번호가 2개 이상인데 bbox를 못 구했으면(확신 없음) "검토필요"로 페이지 전체를 보낸다.
+    - 사건번호가 없으면 빈 리스트.
+    - 사건번호 1개면 페이지 전체 이미지 사용.
+    - 사건번호 2개 이상 + bbox 성공 시에만 표 단위 세로 분할.
+    - bbox 실패 시 REVIEW로 분리(다른 사건에 섞지 않음).
     """
     if not fallback_case_numbers:
         return []
@@ -139,9 +176,9 @@ def segment_page(
                     image_path=rendered.image_path,
                 )
             ]
-        # bbox 없이 사건번호 2개 이상 감지 -> 확신 없음, 섞이는 것보다 검토필요로 분리
+
         logger.warning(
-            "page %s has %d case numbers but no layout bbox; routing to review",
+            "page %s has %d candidate case starts but no usable layout; routing to review",
             rendered.page_no,
             len(fallback_case_numbers),
         )
@@ -156,7 +193,15 @@ def segment_page(
         ]
 
     markers = layout.markers
-    mixed = len(markers) > 1
+    if len(markers) == 1:
+        return [
+            ImageSegment(
+                case_number=markers[0].case_number,
+                page_no=rendered.page_no,
+                image_path=rendered.image_path,
+            )
+        ]
+
     segments: list[ImageSegment] = []
     for i, marker in enumerate(markers):
         y_top = marker.y_top
@@ -170,7 +215,7 @@ def segment_page(
                 case_number=marker.case_number,
                 page_no=rendered.page_no,
                 image_path=crop_path,
-                from_mixed_page=mixed,
+                from_mixed_page=True,
             )
         )
     return segments

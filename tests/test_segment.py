@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from husik.pdf.render import NativeLine, RenderedPage
-from husik.pdf.segment import REVIEW_LABEL, segment_page
+from husik.pdf.segment import REVIEW_LABEL, detect_page_layout, segment_page
 
 
 def _rendered(page_no, native_lines, image_height=1000, image_path=None):
@@ -70,6 +70,20 @@ def test_two_case_numbers_without_bbox_routes_to_review(tmp_path):
     assert segments[0].is_review is True
     assert segments[0].case_number == REVIEW_LABEL
     assert segments[0].image_path == rendered.image_path
+
+
+def test_detect_page_layout_ignores_right_side_body_case_numbers():
+    rendered = _rendered(
+        1,
+        [
+            NativeLine(text="2025타경1708", y_top=20, y_bottom=40, x_left=20, x_right=180),
+            NativeLine(text="본문 참조 2016타경7487", y_top=200, y_bottom=220, x_left=500, x_right=760),
+        ],
+    )
+
+    layout = detect_page_layout(rendered)
+    assert layout is not None
+    assert [m.case_number for m in layout.markers] == ["2025타경1708"]
 
 
 def test_review_segment_never_shares_case_number_with_real_case(tmp_path):

@@ -10,8 +10,10 @@ from husik.utils.text import (
     dollar_count,
     extract_case_numbers,
     extract_dollar_rating,
+    extract_progress_status,
     extract_sale_date,
     extract_title_candidates,
+    has_title_grade_marker,
     looks_like_uncertain_case_marker,
     normalize_case_number,
     normalize_sale_date,
@@ -98,6 +100,18 @@ def test_extract_title_candidates_skips_source_lines():
     assert candidates == ["효창공원 시프트 SSS"]
 
 
+def test_extract_title_candidates_removes_region_tags():
+    text = "성북3 $$$ [투기과열지구 / 조정대상지역]"
+    candidates = extract_title_candidates(text)
+    assert candidates == ["성북3 $$$"]
+
+
+def test_has_title_grade_marker_accepts_dollar_and_sss():
+    assert has_title_grade_marker("효창공원 시프트 $$$") is True
+    assert has_title_grade_marker("효창공원 시프트 SSS") is True
+    assert has_title_grade_marker("효창공원 시프트 일반") is False
+
+
 def test_extract_sale_date_supports_dot_format():
     text = "매각기일 : 2026.05.19"
     assert extract_sale_date(text) == "2026.5.19"
@@ -113,6 +127,11 @@ def test_extract_sale_date_supports_dash_format():
     assert extract_sale_date(text) == "2026.5.19"
 
 
+def test_extract_sale_date_supports_maegakil_variant():
+    text = "매각일 : 2026.05.19"
+    assert extract_sale_date(text) == "2026.5.19"
+
+
 def test_extract_sale_date_returns_none_without_date():
     assert extract_sale_date("매각기일 : 확인중") is None
 
@@ -120,6 +139,12 @@ def test_extract_sale_date_returns_none_without_date():
 def test_normalize_sale_date_with_tuple_and_date_object():
     assert normalize_sale_date((2026, 5, 19)) == "2026.5.19"
     assert normalize_sale_date(date(2026, 5, 19)) == "2026.5.19"
+
+
+def test_extract_progress_status_from_label_and_token():
+    assert extract_progress_status("진행상태: 낙찰") == "낙찰"
+    assert extract_progress_status("유찰") == "유찰"
+    assert extract_progress_status("상태: 확인중") is None
 
 
 # --- classify_rating: 필터가 아니라 분류 태그 -----------------------------------

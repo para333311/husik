@@ -23,6 +23,8 @@ class NativeLine:
     text: str
     y_top: float
     y_bottom: float
+    x_left: float = 0.0
+    x_right: float = 0.0
 
 
 @dataclass
@@ -46,15 +48,34 @@ def _build_native_lines(page: fitz.Page, matrix: fitz.Matrix, post_scale: float)
         bottom_right = fitz.Point(x1, y1) * matrix
         y_top = min(top_left.y, bottom_right.y) * post_scale
         y_bottom = max(top_left.y, bottom_right.y) * post_scale
+        x_left = min(top_left.x, bottom_right.x) * post_scale
+        x_right = max(top_left.x, bottom_right.x) * post_scale
 
         key = (block_no, line_no)
-        entry = lines.setdefault(key, {"words": [], "y_top": y_top, "y_bottom": y_bottom})
+        entry = lines.setdefault(
+            key,
+            {
+                "words": [],
+                "y_top": y_top,
+                "y_bottom": y_bottom,
+                "x_left": x_left,
+                "x_right": x_right,
+            },
+        )
         entry["words"].append(word)
         entry["y_top"] = min(entry["y_top"], y_top)
         entry["y_bottom"] = max(entry["y_bottom"], y_bottom)
+        entry["x_left"] = min(entry["x_left"], x_left)
+        entry["x_right"] = max(entry["x_right"], x_right)
 
     return [
-        NativeLine(text=" ".join(v["words"]), y_top=v["y_top"], y_bottom=v["y_bottom"])
+        NativeLine(
+            text=" ".join(v["words"]),
+            y_top=v["y_top"],
+            y_bottom=v["y_bottom"],
+            x_left=v["x_left"],
+            x_right=v["x_right"],
+        )
         for v in sorted(lines.values(), key=lambda v: v["y_top"])
     ]
 
