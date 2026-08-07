@@ -1,7 +1,8 @@
 """data/state 아래 JSON으로 처리 상태를 저장하는 StateStore.
 
-원본 PDF/이미지는 여기 저장하지 않는다. Telegram update offset, 처리된 PDF hash,
-사건번호별 대표 메시지/이미지 메시지 ID, Notion page ID만 보관한다.
+원본 PDF/이미지는 여기 저장하지 않는다. Telegram update offset,
+처리된 update/message 식별자, 참고용 PDF hash, 사건번호별 대표 메시지/이미지
+메시지 ID, Notion page ID만 보관한다.
 """
 from __future__ import annotations
 
@@ -42,7 +43,13 @@ class CaseState:
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"telegram_offset": 0, "processed_pdf_hashes": {}, "cases": {}}
+    return {
+        "telegram_offset": 0,
+        "processed_updates": [],
+        "processed_messages": {},
+        "processed_pdf_hashes": {},
+        "cases": {},
+    }
 
 
 class StateStore:
@@ -60,6 +67,28 @@ class StateStore:
                 data = json.load(f)
             for key, default in _empty_state().items():
                 data.setdefault(key, default)
+
+            if not isinstance(data.get("processed_pdf_hashes"), dict):
+                data["processed_pdf_hashes"] = {}
+            if not isinstance(data.get("cases"), dict):
+                data["cases"] = {}
+
+            updates = data.get("processed_updates", [])
+            if not isinstance(updates, list):
+                updates = []
+            data["processed_updates"] = [int(v) for v in updates if isinstance(v, int) or str(v).isdigit()]
+
+            normalized_messages: dict[str, list[int]] = {}
+            raw_messages = data.get("processed_messages", {})
+            if isinstance(raw_messages, dict):
+                for chat_key, ids in raw_messages.items():
+                    chat_id = str(chat_key)
+                    if not isinstance(ids, list):
+                        continue
+                    normalized = [int(v) for v in ids if isinstance(v, int) or str(v).isdigit()]
+                    if normalized:
+                        normalized_messages[chat_id] = normalized
+            data["processed_messages"] = normalized_messages
             return data
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("failed to load state file %s, starting fresh: %s", self.path, exc)
@@ -83,6 +112,28 @@ class StateStore:
     @telegram_offset.setter
     def telegram_offset(self, value: int) -> None:
         self._data["telegram_offset"] = value
+
+    def has_processed_update(self, update_id: int) -> bool:
+        return int(update_id) in self._data.setdefault("processed_updates", [])
+
+    def mark_update_processed(self, update_id: int) -> None:
+        update_ids = self._data.setdefault("processed_updates", [])
+        value = int(update_id)
+        if value not in update_ids:
+            update_ids.append(value)
+
+    def has_processed_message(self, chat_id: str | int, message_id: int) -> bool:
+        messages = self._data.setdefault("processed_messages", {})
+        chat_key = str(chat_id)
+        return int(message_id) in messages.get(chat_key, [])
+
+    def mark_message_processed(self, chat_id: str | int, message_id: int) -> None:
+        messages = self._data.setdefault("processed_messages", {})
+        chat_key = str(chat_id)
+        msg_list = messages.setdefault(chat_key, [])
+        value = int(message_id)
+        if value not in msg_list:
+            msg_list.append(value)
 
     def has_processed_pdf(self, pdf_hash: str) -> bool:
         return pdf_hash in self._data.setdefault("processed_pdf_hashes", {})

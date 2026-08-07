@@ -54,7 +54,7 @@ CHANNEL_FAIL_MSG = "텔레그램 채널 전송 실패: 채널 ID 또는 봇 관�
 NOTION_FAIL_MSG = (
     "텔레그램 전송은 완료됐지만 노션 업데이트에 실패했습니다. Integration 연결 또는 DB URL을 확인하세요."
 )
-DUPLICATE_MSG = "이미 처리된 PDF입니다 (중복)."
+DUPLICATE_MSG = "이미 처리된 메시지입니다."
 GENERIC_FAIL_MSG = "PDF 처리 중 오류가 발생했습니다."
 
 
@@ -78,6 +78,7 @@ class IngestStats:
     skipped_by_user: int = 0
     downloaded_pdfs: int = 0
     duplicate_pdfs_skipped: int = 0
+    duplicate_messages_skipped: int = 0
     pages_rendered: int = 0
     detected_cases: int = 0
     filtered_cases: int = 0
@@ -734,6 +735,25 @@ def _handle_update(
         return
     stats.pdf_documents_seen += 1
 
+    update_id = update.get("update_id")
+    message_id = message.get("message_id")
+
+    if update_id is not None and state.has_processed_update(update_id):
+        stats.duplicate_messages_skipped += 1
+        telegram.send_message(chat_id, DUPLICATE_MSG)
+        stats.user_notifications_sent += 1
+        return
+    if message_id is not None and state.has_processed_message(chat_id, message_id):
+        stats.duplicate_messages_skipped += 1
+        telegram.send_message(chat_id, DUPLICATE_MSG)
+        stats.user_notifications_sent += 1
+        return
+
+    if update_id is not None:
+        state.mark_update_processed(update_id)
+    if message_id is not None:
+        state.mark_message_processed(chat_id, message_id)
+
     file_id = document["file_id"]
     file_size = document.get("file_size") or 0
     if file_size and file_size > MAX_PDF_BYTES:
@@ -757,18 +777,20 @@ def _handle_update(
     try:
         pdf_hash = hash_file(pdf_path)
         if state.has_processed_pdf(pdf_hash):
-            stats.duplicate_pdfs_skipped += 1
-            telegram.send_message(chat_id, DUPLICATE_MSG)
-            stats.user_notifications_sent += 1
-            return
+            logger.info(
+                "reprocessing requested: same pdf hash with new telegram message "
+                "(chat_id=%s, message_id=%s, hash=%s)",
+                chat_id,
+                message_id,
+                pdf_hash,
+            )
 
         run_result = process_pdf_and_send(pdf_path, config, state, tmp_root, stats)
-        # 성공 기준 = 사건번호 기준 전송 성공. 사건번호를 못 찾았거나(0건) 텔레그램
-        # 전송이 실패했으면 해시를 저장하지 않아 같은 PDF를 다시 보내면 재처리된다.
+        # PDF hash는 참고용 로그/이력으로만 저장한다 (재처리 차단 기준으로 사용하지 않음).
         if run_result.cases_sent > 0:
             state.mark_pdf_processed(pdf_hash, {"file_name": document.get("file_name", "")})
         else:
-            logger.info("pdf not marked as processed (no case successfully sent); can be retried")
+            logger.info("pdf hash history not saved (no case successfully sent)")
 
         for note in build_result_notifications(run_result):
             telegram.send_message(chat_id, note)
