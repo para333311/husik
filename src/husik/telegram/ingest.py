@@ -104,9 +104,9 @@ class CaseProcessResult:
     rating: str
     title: str
     sale_date: date | None
-    image_count: int
     page_start: int
     page_end: int
+    image_count: int
     processed: bool
     reason: str = ""
     page_image_map: str = ""
@@ -171,9 +171,9 @@ def dry_run_report(records: list[CaseRecord]) -> list[CaseProcessResult]:
                 rating=r.rating,
                 title=r.title,
                 sale_date=r.sale_date,
-                image_count=len(r.image_segments),
                 page_start=r.page_start,
                 page_end=r.page_end,
+                image_count=len(r.image_segments),
                 processed=True,
                 reason="",
                 page_image_map=", ".join(_format_page_image_refs(r)),
@@ -302,7 +302,7 @@ def send_case_to_telegram(
     telegram: TelegramClient, channel_id: str, record: CaseRecord, message_text: str
 ) -> _CaseTelegramResult:
     try:
-        sent = telegram.send_message(channel_id, message_text, parse_mode="HTML")
+        sent = telegram.send_message(channel_id, message_text)
     except TelegramError as exc:
         raise ChannelSendError(str(exc)) from exc
     rep_id = sent["message_id"]
@@ -319,7 +319,7 @@ def send_case_to_telegram(
         reply_id = rep_id
         if start > 0:
             header_text = _continue_header(record.case_number, continuation_index)
-            followup = telegram.send_message(channel_id, header_text, parse_mode="HTML")
+            followup = telegram.send_message(channel_id, header_text)
             reply_id = followup["message_id"]
             continuation_index += 1
 
@@ -350,6 +350,7 @@ def _to_message_data(record: CaseRecord, auction_info, interest: InterestStats) 
         case_number=record.case_number,
         rating=record.rating or RATING_UNKNOWN,
         title=record.title,
+        sale_date_text=record.sale_date,
         auction=auction,
         interest=interest,
         image_count=len(record.image_segments),

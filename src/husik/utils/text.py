@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 
 # 20xx + 타경 + 숫자 4~8자리. 공백은 연도/타/경/일련번호 사이 어디에 있어도 허용한다.
 CASE_NUMBER_PATTERN = re.compile(r"(20\d{2})\s*타\s*경\s*(\d{4,8})")
@@ -28,6 +29,9 @@ RATING_4 = "$$$$"
 RATING_3 = "$$$"
 RATING_LOW = "낮은등급"
 RATING_UNKNOWN = "등급확인"
+
+SALE_DATE_LABEL_RE = re.compile(r"매각\s*기\s*일\s*[:：]?\s*", re.IGNORECASE)
+SALE_DATE_RE = re.compile(r"(20\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})")
 
 _RATING_COUNTS = {RATING_5: 5, RATING_4: 4, RATING_3: 3, RATING_LOW: 0, RATING_UNKNOWN: 0}
 
@@ -131,12 +135,48 @@ def extract_title_candidates(text: str, max_candidates: int = 5) -> list[str]:
         stripped = line.strip()
         if not stripped or len(stripped) < 2:
             continue
+        if "매수맛집" in stripped:
+            continue
         compact = stripped.replace(" ", "")
         if DOLLAR_PATTERN.fullmatch(compact):
             continue
         if CASE_NUMBER_PATTERN.fullmatch(stripped) or CASE_NUMBER_PATTERN.fullmatch(compact):
             continue
+        if SALE_DATE_LABEL_RE.search(stripped):
+            continue
         candidates.append(stripped)
         if len(candidates) >= max_candidates:
             break
     return candidates
+
+
+def normalize_sale_date(value: date | tuple[int, int, int] | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, date):
+        year, month, day = value.year, value.month, value.day
+    else:
+        year, month, day = value
+    try:
+        d = date(int(year), int(month), int(day))
+    except (TypeError, ValueError):
+        return None
+    return f"{d.year}.{d.month}.{d.day}"
+
+
+def extract_sale_date(text: str) -> str | None:
+    """"매각기일" 주변 날짜를 추출해 `YYYY.M.D` 형식으로 정규화한다."""
+    value = text or ""
+    for match in SALE_DATE_LABEL_RE.finditer(value):
+        window = value[match.end() : match.end() + 60]
+        date_match = SALE_DATE_RE.search(window)
+        if date_match:
+            return normalize_sale_date(tuple(int(x) for x in date_match.groups()))
+
+    for line in value.splitlines():
+        if SALE_DATE_LABEL_RE.search(line):
+            date_match = SALE_DATE_RE.search(line)
+            if date_match:
+                return normalize_sale_date(tuple(int(x) for x in date_match.groups()))
+
+    return None

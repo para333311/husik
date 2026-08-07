@@ -13,6 +13,7 @@ def _build_mixed_page_pdf(path) -> None:
     page.insert_font(fontname="F0", fontbuffer=font.buffer)
     page.insert_text((50, 80), "사당 15 추천 $$$", fontsize=14, fontname="F0")
     page.insert_text((50, 105), "2025타경102095", fontsize=14, fontname="F0")
+    page.insert_text((50, 130), "매각기일 : 2026.05.19", fontsize=13, fontname="F0")
     page.insert_text((50, 500), "둔촌 34 매물", fontsize=14, fontname="F0")
     page.insert_text((50, 525), "2025타경200000", fontsize=14, fontname="F0")
     doc.save(str(path))
@@ -83,6 +84,7 @@ def test_case_number_without_rating_is_still_processed_and_gets_its_own_images(t
     by_case = {r.case_number: r for r in report.results}
     assert by_case["2024타경12345"].rating == "$$$$"
     assert by_case["2024타경12345"].processed is True
+    assert by_case["2024타경12345"].image_count >= 1
     # 등급이 전혀 안 잡혀도(등급확인) 여전히 전송 대상이어야 한다.
     assert by_case["2024타경9999"].rating == "등급확인"
     assert by_case["2024타경9999"].processed is True
@@ -90,3 +92,17 @@ def test_case_number_without_rating_is_still_processed_and_gets_its_own_images(t
     assert "p1" in by_case["2024타경12345"].page_image_map
     assert "p3" in by_case["2024타경9999"].page_image_map
     assert "p3" not in by_case["2024타경12345"].page_image_map
+
+
+def test_sale_date_is_extracted_into_case_record(tmp_path):
+    pdf_path = tmp_path / "mixed_page.pdf"
+    _build_mixed_page_pdf(pdf_path)
+    config = _make_config(tmp_path)
+    state = StateStore(config.state_dir)
+
+    report = process_pdf(pdf_path, config, state, send=False, tmp_root=config.tmp_dir)
+
+    by_case = {r.case_number: r for r in report.results}
+    sale_date = by_case["2025타경102095"].sale_date
+    assert sale_date is not None
+    assert f"{sale_date.year}.{sale_date.month}.{sale_date.day}" == "2026.5.19"

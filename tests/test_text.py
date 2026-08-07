@@ -1,3 +1,5 @@
+from datetime import date
+
 from husik.utils.text import (
     RATING_3,
     RATING_4,
@@ -8,9 +10,11 @@ from husik.utils.text import (
     dollar_count,
     extract_case_numbers,
     extract_dollar_rating,
+    extract_sale_date,
     extract_title_candidates,
     looks_like_uncertain_case_marker,
     normalize_case_number,
+    normalize_sale_date,
     rating_to_count,
 )
 
@@ -86,6 +90,36 @@ def test_extract_title_candidates_skips_case_and_dollar_lines():
     text = "강남 아파트 특급매물\n2024타경12345\n$$$$\n"
     candidates = extract_title_candidates(text)
     assert candidates == ["강남 아파트 특급매물"]
+
+
+def test_extract_title_candidates_skips_source_lines():
+    text = "매수맛집 경매 리포트\n효창공원 시프트 SSS\n2025타경1708"
+    candidates = extract_title_candidates(text)
+    assert candidates == ["효창공원 시프트 SSS"]
+
+
+def test_extract_sale_date_supports_dot_format():
+    text = "매각기일 : 2026.05.19"
+    assert extract_sale_date(text) == "2026.5.19"
+
+
+def test_extract_sale_date_supports_dot_non_padded_format():
+    text = "매각기일 2026.5.19"
+    assert extract_sale_date(text) == "2026.5.19"
+
+
+def test_extract_sale_date_supports_dash_format():
+    text = "매각 기일 2026-5-19"
+    assert extract_sale_date(text) == "2026.5.19"
+
+
+def test_extract_sale_date_returns_none_without_date():
+    assert extract_sale_date("매각기일 : 확인중") is None
+
+
+def test_normalize_sale_date_with_tuple_and_date_object():
+    assert normalize_sale_date((2026, 5, 19)) == "2026.5.19"
+    assert normalize_sale_date(date(2026, 5, 19)) == "2026.5.19"
 
 
 # --- classify_rating: 필터가 아니라 분류 태그 -----------------------------------

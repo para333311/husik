@@ -1,29 +1,14 @@
-"""텔레그램 대표 메시지 / 업데이트 메시지 텍스트 빌더."""
+"""텔레그램 사건 대표 메시지 텍스트 빌더 (간소화 버전)."""
 from __future__ import annotations
 
-import html
 from dataclasses import dataclass, field
 from datetime import date
 
 from husik.utils.dates import format_compact_date
-from husik.utils.money import format_money, format_rate
 
 MESSAGE_LIMIT = 3800
 DIVIDER = "-" * 20
 UNKNOWN = "확인중"
-
-
-def _is_known(value: str | None) -> bool:
-    return bool(value) and value != UNKNOWN
-
-
-def _esc(value: object) -> str:
-    """parse_mode=HTML로 보내므로, OCR/외부에서 온 자유 텍스트는 반드시 이스케이프한다."""
-    return html.escape(str(value), quote=False)
-
-
-def _esc_attr(value: str) -> str:
-    return html.escape(value, quote=True)
 
 
 @dataclass
@@ -54,6 +39,7 @@ class CaseMessageData:
     case_number: str
     rating: str
     title: str
+    sale_date_text: str | None = None
     item_number: str = UNKNOWN
     auction: AuctionFields = field(default_factory=AuctionFields)
     interest: InterestStats = field(default_factory=InterestStats)
@@ -63,7 +49,6 @@ class CaseMessageData:
 
 
 def auction_fields_from_dict(data: dict) -> AuctionFields:
-    """auction.monitor 등이 직렬화해 state에 저장한 dict를 AuctionFields로 복원한다."""
     sale_date_raw = data.get("sale_date")
     sale_date: date | None = None
     if sale_date_raw:
@@ -87,19 +72,16 @@ def auction_fields_from_dict(data: dict) -> AuctionFields:
 
 
 def build_header(data: CaseMessageData, event_tag: str | None = None) -> str:
-    base = f"[{_esc(data.case_number)}]"
-    if not event_tag:
-        return base
-    return f"[{_esc(event_tag)}] {base}"
+    base = f"[{data.case_number}]"
+    return f"[{event_tag}] {base}" if event_tag else base
 
 
 def build_body(data: CaseMessageData, update_log: list[str] | None = None) -> str:
-    a = data.auction
-    sale_date = format_compact_date(a.sale_date)
     lines: list[str] = []
-
     if data.title and data.title != data.case_number:
-        lines.append(_esc(data.title))
+        lines.append(data.title)
+
+    sale_date = data.sale_date_text or format_compact_date(data.auction.sale_date)
     lines.append(f"ㅇ 매각기일 : {sale_date}")
     lines.append("ㅇ 상태 :")
     lines.append(f"ㅇ 이미지 {data.image_count}장")
@@ -107,24 +89,13 @@ def build_body(data: CaseMessageData, update_log: list[str] | None = None) -> st
 
 
 def build_award_result_block(data: CaseMessageData) -> str:
-    a = data.auction
-    lines = [f"상태: {_esc(a.status or UNKNOWN)}"]
-    if a.appraisal_price is not None:
-        lines.append(f"감정가: {format_money(a.appraisal_price)}")
-    if a.min_price is not None:
-        lines.append(f"최저가: {format_money(a.min_price)}")
-    lines.append(f"낙찰가: {format_money(a.winning_price)}")
-    lines.append(f"낙찰가율: {format_rate(a.winning_rate)}")
-    lines.append(f"입찰인수: {a.bidder_count if a.bidder_count is not None else UNKNOWN}명")
-    if a.madangs_link and a.madangs_link.startswith("http"):
-        lines.append(f'경매마당 링크: <a href="{_esc_attr(a.madangs_link)}">경매마당</a>')
-    return "\n".join(lines)
+    return build_body(data)
 
 
 def truncate_message(text: str, limit: int = MESSAGE_LIMIT) -> str:
     if len(text) <= limit:
         return text
-    return text[: limit - 20].rstrip() + "\n...(생략, Notion 참고)"
+    return text[: limit - 20].rstrip() + "\n...(생략)"
 
 
 def build_representative_message(data: CaseMessageData) -> str:
@@ -133,7 +104,6 @@ def build_representative_message(data: CaseMessageData) -> str:
 
 
 def build_event_update(event_tag: str, data: CaseMessageData, existing_message: str) -> str:
-    """블로그업데이트/상태변경 등 새 이벤트를 맨 위에 붙이고 기존 내용을 아래에 유지한다."""
     header = build_header(data, event_tag=event_tag)
     block = header + "\n\n" + build_body(data)
     combined = f"{block}\n{DIVIDER}\n기존 내용\n{existing_message}"
