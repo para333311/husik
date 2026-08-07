@@ -38,6 +38,10 @@ TITLE_GRADE_RE = re.compile(r"(?:\${2,10}\+?|[Ss]{3,10}|\$\$\+)")
 TITLE_BLOCKED_TAG_RE = re.compile(
     r"\[(?:투기과열지구(?:\s*/\s*조정대상지역)?|조정대상지역|토지거래허가구역(?:\s*/\s*조정대상지역)?)\]"
 )
+TITLE_BLOCKED_PHRASES_RE = re.compile(
+    r"(?:투기과열지구\s*/\s*조정대상지역|토지거래허가구역\s*/\s*조정대상지역|"
+    r"투기과열지구|조정대상지역|토지거래허가구역|매수맛집|부동산강제경매)"
+)
 
 _RATING_COUNTS = {RATING_5: 5, RATING_4: 4, RATING_3: 3, RATING_LOW: 0, RATING_UNKNOWN: 0}
 
@@ -136,6 +140,8 @@ def rating_to_count(rating: str | None) -> int:
 
 def _clean_title_line(line: str) -> str:
     cleaned = TITLE_BLOCKED_TAG_RE.sub("", line)
+    cleaned = TITLE_BLOCKED_PHRASES_RE.sub("", cleaned)
+    cleaned = cleaned.replace("[]", " ")
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
@@ -147,10 +153,10 @@ def extract_title_candidates(text: str, max_candidates: int = 5) -> list[str]:
     """사건번호/달러표시만 있는 줄을 제외한 제목 후보 줄들을 추출한다."""
     candidates: list[str] = []
     for line in (text or "").splitlines():
+        if "매수맛집" in line:
+            continue
         stripped = _clean_title_line(line.strip())
         if not stripped or len(stripped) < 2:
-            continue
-        if "매수맛집" in stripped:
             continue
         compact = stripped.replace(" ", "")
         if DOLLAR_PATTERN.fullmatch(compact):

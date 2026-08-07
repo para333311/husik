@@ -11,11 +11,20 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
-from PIL import Image
-
-from husik.pdf.ocr import extract_page_text, openai_vision_case_numbers
+from husik.pdf.ocr import (
+    extract_page_text,
+    openai_vision_case_metadata,
+    openai_vision_case_numbers,
+    tesseract_ocr_regions,
+)
 from husik.pdf.render import RenderedPage
-from husik.pdf.segment import REVIEW_LABEL, ImageSegment, detect_page_layout, segment_page
+from husik.pdf.segment import (
+    REVIEW_LABEL,
+    ImageSegment,
+    compose_slides_into_bundles,
+    detect_page_layout,
+    segment_page,
+)
 from husik.utils.dates import parse_sale_date_from_text
 from husik.utils.text import (
     RATING_3,
@@ -29,6 +38,7 @@ from husik.utils.text import (
     extract_title_candidates,
     has_title_grade_marker,
     looks_like_uncertain_case_marker,
+    normalize_sale_date,
     rating_to_count,
 )
 
@@ -36,7 +46,6 @@ TOP_LEFT_X_RATIO = 0.45
 TOP_LEFT_Y_RATIO = 0.25
 RATING_LOOKAHEAD_PAGES = 3
 MIN_TITLE_LENGTH = 4
-MAX_MERGED_IMAGE_HEIGHT = 7800
 _RATING_PRIORITY = {RATING_5: 5, RATING_4: 4, RATING_3: 3, RATING_LOW: 1, RATING_UNKNOWN: 0}
 
 
@@ -51,6 +60,7 @@ class PageAnalysis:
     uncertain_marker: bool = False
     page_case_numbers: list[str] = field(default_factory=list)
     status: str | None = None
+    sale_date_hint: date | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -61,6 +71,7 @@ class PageAnalysis:
             "title_candidates": self.title_candidates,
             "raw_text": self.raw_text,
             "status": self.status,
+            "sale_date_hint": normalize_sale_date(self.sale_date_hint),
         }
 
 
@@ -74,6 +85,7 @@ class CaseRecord:
     sale_date: date | None = None
     status: str | None = None
     pages: list[PageAnalysis] = field(default_factory=list)
+    slide_segments: list[ImageSegment] = field(default_factory=list)
     image_segments: list[ImageSegment] = field(default_factory=list)
 
     @property
@@ -102,19 +114,16 @@ def _unique(values: list[str]) -> list[str]:
 
 
 def _extract_top_left_cases_with_tesseract(rendered: RenderedPage) -> list[str]:
-    try:
-        import pytesseract
-    except ImportError:
-        return []
-
-    with Image.open(rendered.image_path) as img:
-        width, height = img.size
-        crop = img.crop((0, 0, int(width * TOP_LEFT_X_RATIO), int(height * TOP_LEFT_Y_RATIO)))
-        try:
-            text = pytesseract.image_to_string(crop, lang="kor+eng")
-        except Exception:
-            return []
-    return extract_case_numbers(text)
+    ocr_map = tesseract_ocr_regions(
+        rendered.image_path,
+        [
+            ("top_left", (0.0, 0.0, TOP_LEFT_X_RATIO, TOP_LEFT_Y_RATIO)),
+            ("top_band", (0.0, 0.0, 0.85, 0.30)),
+        ],
+    )
+    return _unique(
+        extract_case_numbers((ocr_map.get("top_left") or "") + "\n" + (ocr_map.get("top_band") or ""))
+    )
 
 
 def _extract_page_case_numbers(rendered: RenderedPage) -> tuple[list[str], list[str]]:
@@ -142,24 +151,80 @@ def analyze_page(rendered: RenderedPage, openai_api_key: str | None = None) -> P
 
     top_case_numbers, page_case_numbers = _extract_page_case_numbers(rendered)
 
+    region_ocr = tesseract_ocr_regions(
+        rendered.image_path,
+        [
+            ("case", (0.0, 0.0, TOP_LEFT_X_RATIO, TOP_LEFT_Y_RATIO)),
+            ("title", (0.0, 0.68, 1.0, 1.0)),
+            ("sale", (0.35, 0.0, 1.0, 0.38)),
+        ],
+    )
+    region_case_numbers = _unique(
+        extract_case_numbers((region_ocr.get("case") or "") + "\n" + (region_ocr.get("sale") or ""))
+    )
+    if not top_case_numbers and region_case_numbers:
+        top_case_numbers = list(region_case_numbers)
+    if not page_case_numbers and region_case_numbers:
+        page_case_numbers = list(region_case_numbers)
+
+    title_candidates = extract_title_candidates(text)
+    if not title_candidates:
+        title_candidates = extract_title_candidates(region_ocr.get("title", ""))
+
+    status = extract_progress_status(text) or extract_progress_status(region_ocr.get("sale", ""))
+    sale_date_hint = parse_sale_date_from_text(text) or parse_sale_date_from_text(region_ocr.get("sale", ""))
+
+    vision_payload = None
+    needs_vision = (not top_case_numbers) or (len(page_case_numbers) > 1 and not top_case_numbers)
+    if needs_vision and openai_api_key:
+        try:
+            vision_payload = openai_vision_case_metadata(rendered.image_path, openai_api_key)
+        except Exception:
+            vision_payload = None
+
+        if vision_payload and vision_payload.case_number:
+            if not top_case_numbers:
+                top_case_numbers = [vision_payload.case_number]
+            if not page_case_numbers:
+                page_case_numbers = [vision_payload.case_number]
+            elif len(page_case_numbers) > 1 and vision_payload.case_number in page_case_numbers:
+                top_case_numbers = [vision_payload.case_number]
+
+        if vision_payload and vision_payload.title and not title_candidates:
+            title_candidates = extract_title_candidates(vision_payload.title) or [vision_payload.title]
+        if vision_payload and vision_payload.sale_date and sale_date_hint is None:
+            sale_date_hint = vision_payload.sale_date
+        if vision_payload and vision_payload.status and not status:
+            status = vision_payload.status
+
     if not top_case_numbers and openai_api_key:
-        # Vision fallback은 "대표 사건번호"에만 사용한다.
-        top_case_numbers = openai_vision_case_numbers(rendered.image_path, openai_api_key)
-        top_case_numbers = _unique(top_case_numbers)
-        if not page_case_numbers:
+        # 마지막 안전망: 사건번호 목록만 재질의
+        try:
+            top_case_numbers = _unique(openai_vision_case_numbers(rendered.image_path, openai_api_key))
+        except Exception:
+            top_case_numbers = []
+        if top_case_numbers and not page_case_numbers:
             page_case_numbers = list(top_case_numbers)
 
-    uncertain = looks_like_uncertain_case_marker(text) if not top_case_numbers else False
+    uncertain_source = "\n".join(
+        [
+            text,
+            region_ocr.get("case", ""),
+            region_ocr.get("sale", ""),
+        ]
+    )
+    uncertain = looks_like_uncertain_case_marker(uncertain_source) if not top_case_numbers else False
     return PageAnalysis(
         page_no=rendered.page_no,
         case_numbers=top_case_numbers,
         page_case_numbers=page_case_numbers,
         rating=classify_rating(text),
-        title_candidates=extract_title_candidates(text),
+        title_candidates=title_candidates,
         raw_text=text,
         image_path=rendered.image_path,
         uncertain_marker=uncertain,
-        status=extract_progress_status(text),
+        status=status,
+        sale_date_hint=sale_date_hint,
     )
 
 
@@ -179,6 +244,9 @@ def _pick_title(pages: list[PageAnalysis], fallback: str) -> str:
 
 
 def _pick_sale_date(pages: list[PageAnalysis]) -> date | None:
+    for page in pages:
+        if page.sale_date_hint is not None:
+            return page.sale_date_hint
     for page in pages:
         found = parse_sale_date_from_text(page.raw_text)
         if found is not None:
@@ -254,68 +322,27 @@ def group_pages_into_cases(pages: list[PageAnalysis]) -> list[CaseRecord]:
 def split_uncertain_continuations(
     records: list[CaseRecord],
 ) -> tuple[list[CaseRecord], list[PageAnalysis]]:
-    # 정책 단순화: 연속 페이지 붙이기 규칙만으로 사건 구간을 만든다.
-    return records, []
+    """사건번호가 불확실한 페이지는 직전 사건에 붙이지 않고 검토필요로 분리한다."""
+    review_pages: list[PageAnalysis] = []
+    cleaned_records: list[CaseRecord] = []
 
+    for record in records:
+        kept_pages: list[PageAnalysis] = []
+        for page in record.pages:
+            if not page.case_numbers and page.uncertain_marker:
+                review_pages.append(page)
+                continue
+            kept_pages.append(page)
 
-def _merge_case_segments(
-    case_number: str,
-    segments: list[ImageSegment],
-    work_dir: Path,
-) -> list[ImageSegment]:
-    if len(segments) <= 1:
-        return segments
+        if not kept_pages:
+            continue
 
-    sized: list[tuple[ImageSegment, int, int]] = []
-    for seg in segments:
-        with Image.open(seg.image_path) as img:
-            sized.append((seg, img.width, img.height))
+        record.pages = kept_pages
+        record.page_start = min(p.page_no for p in kept_pages)
+        record.page_end = max(p.page_no for p in kept_pages)
+        cleaned_records.append(record)
 
-    chunks: list[list[tuple[ImageSegment, int, int]]] = []
-    current: list[tuple[ImageSegment, int, int]] = []
-    current_height = 0
-
-    for item in sized:
-        seg, _width, height = item
-        if current and current_height + height > MAX_MERGED_IMAGE_HEIGHT:
-            chunks.append(current)
-            current = [item]
-            current_height = height
-        else:
-            current.append(item)
-            current_height += height
-
-    if current:
-        chunks.append(current)
-
-    if len(chunks) == len(segments):
-        return segments
-
-    merged_segments: list[ImageSegment] = []
-    for idx, chunk in enumerate(chunks, start=1):
-        width = max(w for _seg, w, _h in chunk)
-        height = sum(h for _seg, _w, h in chunk)
-
-        canvas = Image.new("RGB", (width, height), color="white")
-        y_offset = 0
-        for seg, _w, h in chunk:
-            with Image.open(seg.image_path) as part:
-                canvas.paste(part, (0, y_offset))
-            y_offset += h
-
-        out_path = work_dir / f"{case_number}_merged_{idx:02d}.jpg"
-        canvas.save(out_path, "JPEG", quality=88, optimize=True)
-
-        merged_segments.append(
-            ImageSegment(
-                case_number=case_number,
-                page_no=chunk[0][0].page_no,
-                image_path=out_path,
-                from_mixed_page=any(seg.from_mixed_page for seg, _w, _h in chunk),
-            )
-        )
-
-    return merged_segments
+    return cleaned_records, review_pages
 
 
 def assign_image_segments(
@@ -342,7 +369,7 @@ def assign_image_segments(
         review_segments.extend([seg for seg in segments if seg.is_review or seg.case_number == REVIEW_LABEL])
 
     for record in records:
-        collected: list[ImageSegment] = []
+        slides: list[ImageSegment] = []
         for page in record.pages:
             rendered = rendered_by_page.get(page.page_no)
             if rendered is None:
@@ -355,21 +382,29 @@ def assign_image_segments(
                     for seg in mixed_segments
                     if seg.case_number == record.case_number and not seg.is_review
                 ]
-                collected.extend(matched)
+                slides.extend(matched)
                 continue
 
-            # 기본은 페이지 전체 이미지를 사건에 귀속.
-            collected.append(
+            slides.append(
                 ImageSegment(
                     case_number=record.case_number,
                     page_no=page.page_no,
                     image_path=rendered.image_path,
                     from_mixed_page=False,
+                    order_index=1,
                 )
             )
 
-        collected.sort(key=lambda s: s.page_no)
-        record.image_segments = _merge_case_segments(record.case_number, collected, work_dir)
+        slides.sort(key=lambda s: (s.page_no, s.order_index))
+        for seg in slides:
+            if not seg.source_refs:
+                if seg.from_mixed_page:
+                    seg.source_refs = [f"p{seg.page_no} crop{seg.order_index}"]
+                else:
+                    seg.source_refs = [f"p{seg.page_no}"]
+
+        record.slide_segments = slides
+        record.image_segments = compose_slides_into_bundles(record.case_number, slides, work_dir)
 
     # 분할 실패로 REVIEW로 빠진 페이지는 어떤 사건에도 섞지 않는다.
     return review_segments

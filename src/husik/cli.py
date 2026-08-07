@@ -71,12 +71,13 @@ def cmd_process_local_pdf(args: argparse.Namespace) -> int:
         if r.status:
             print(f"상태: {r.status}")
         print(f"페이지범위: {r.page_start}-{r.page_end}")
-        print(f"이미지수: {r.image_count}")
+        print(f"슬라이드: {r.slide_count}개")
+        print(f"합성이미지: {r.image_count}개")
         print(f"처리방식: {r.processing_mode}")
-        if args.debug_layout and r.image_refs:
-            print("이미지범위:")
-            for ref in r.image_refs:
-                print(f"- {ref}")
+        if args.debug_layout and r.bundle_groups:
+            print("묶음:")
+            for group in r.bundle_groups:
+                print(f"- {group}")
         if idx < len(report.results) - 1:
             print()
 

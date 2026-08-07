@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 REVIEW_LABEL = "검토필요"
 LEFT_MARKER_X_RATIO = 0.45
 MAX_MARKER_LINE_LENGTH = 40
+BUNDLE_SIZE = 4
+BUNDLE_WIDTH = 1800
+BUNDLE_GAP = 12
 
 
 @dataclass
@@ -148,6 +151,76 @@ class ImageSegment:
     image_path: Path
     is_review: bool = False
     from_mixed_page: bool = False  # 이 페이지에 사건번호가 2개 이상 있었는지
+    order_index: int = 1
+    source_refs: list[str] = field(default_factory=list)
+    slide_indices: list[int] = field(default_factory=list)
+
+
+def _segment_ref(segment: ImageSegment) -> str:
+    if segment.from_mixed_page:
+        return f"p{segment.page_no} crop{segment.order_index}"
+    return f"p{segment.page_no}"
+
+
+def compose_slides_into_bundles(
+    case_number: str,
+    slides: list[ImageSegment],
+    work_dir: Path,
+    bundle_size: int = BUNDLE_SIZE,
+    target_width: int = BUNDLE_WIDTH,
+    gap: int = BUNDLE_GAP,
+) -> list[ImageSegment]:
+    """슬라이드 4개를 세로 1열 합성 이미지 1장으로 만든다."""
+    if not slides:
+        return []
+
+    sorted_slides = sorted(slides, key=lambda s: (s.page_no, s.order_index))
+    if any(slide.case_number != case_number for slide in sorted_slides):
+        raise ValueError("cannot compose bundle with mixed case numbers")
+    for seg in sorted_slides:
+        if not seg.source_refs:
+            seg.source_refs = [_segment_ref(seg)]
+
+    bundles: list[ImageSegment] = []
+    for index, start in enumerate(range(0, len(sorted_slides), bundle_size), start=1):
+        chunk = sorted_slides[start : start + bundle_size]
+
+        resized_images: list[Image.Image] = []
+        refs: list[str] = []
+        slide_indices: list[int] = []
+        for offset, slide in enumerate(chunk, start=start + 1):
+            with Image.open(slide.image_path) as img:
+                img_rgb = img.convert("RGB")
+                ratio = target_width / max(1, img_rgb.width)
+                new_height = max(1, int(img_rgb.height * ratio))
+                resized_images.append(img_rgb.resize((target_width, new_height), Image.LANCZOS))
+            refs.extend(slide.source_refs or [_segment_ref(slide)])
+            slide_indices.append(offset)
+
+        canvas_height = sum(img.height for img in resized_images) + gap * (len(resized_images) - 1)
+        canvas = Image.new("RGB", (target_width, canvas_height), color="white")
+
+        y = 0
+        for img in resized_images:
+            canvas.paste(img, (0, y))
+            y += img.height + gap
+
+        out_path = work_dir / f"{case_number}_bundle{index:02d}.jpg"
+        canvas.save(out_path, "JPEG", quality=88, optimize=True)
+
+        bundles.append(
+            ImageSegment(
+                case_number=case_number,
+                page_no=chunk[0].page_no,
+                image_path=out_path,
+                from_mixed_page=any(slide.from_mixed_page for slide in chunk),
+                order_index=index,
+                source_refs=refs,
+                slide_indices=slide_indices,
+            )
+        )
+
+    return bundles
 
 
 def segment_page(
@@ -174,6 +247,7 @@ def segment_page(
                     case_number=fallback_case_numbers[0],
                     page_no=rendered.page_no,
                     image_path=rendered.image_path,
+                    order_index=1,
                 )
             ]
 
@@ -189,6 +263,7 @@ def segment_page(
                 image_path=rendered.image_path,
                 is_review=True,
                 from_mixed_page=True,
+                order_index=1,
             )
         ]
 
@@ -199,6 +274,7 @@ def segment_page(
                 case_number=markers[0].case_number,
                 page_no=rendered.page_no,
                 image_path=rendered.image_path,
+                order_index=1,
             )
         ]
 
@@ -216,6 +292,7 @@ def segment_page(
                 page_no=rendered.page_no,
                 image_path=crop_path,
                 from_mixed_page=True,
+                order_index=i + 1,
             )
         )
     return segments

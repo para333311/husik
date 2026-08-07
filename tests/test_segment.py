@@ -1,7 +1,16 @@
 from pathlib import Path
 
+import pytest
+from PIL import Image
+
 from husik.pdf.render import NativeLine, RenderedPage
-from husik.pdf.segment import REVIEW_LABEL, detect_page_layout, segment_page
+from husik.pdf.segment import (
+    REVIEW_LABEL,
+    ImageSegment,
+    compose_slides_into_bundles,
+    detect_page_layout,
+    segment_page,
+)
 
 
 def _rendered(page_no, native_lines, image_height=1000, image_path=None):
@@ -90,3 +99,60 @@ def test_review_segment_never_shares_case_number_with_real_case(tmp_path):
     rendered = _rendered(1, [])
     segments = segment_page(rendered, ["2025타경1001", "2025타경1002", "2025타경1003"], tmp_path)
     assert all(seg.case_number == REVIEW_LABEL for seg in segments)
+
+
+def _slide(
+    tmp_path,
+    idx: int,
+    page_no: int,
+    order_index: int,
+    case_number: str = "2025타경1708",
+) -> ImageSegment:
+    path = tmp_path / f"slide_{idx:02d}.jpg"
+    Image.new("RGB", (400, 240 + idx * 10), color="white").save(path)
+    return ImageSegment(
+        case_number=case_number,
+        page_no=page_no,
+        order_index=order_index,
+        image_path=path,
+        source_refs=[f"p{page_no} crop{order_index}"],
+    )
+
+
+def test_compose_bundle_counts_follow_4_slide_rule(tmp_path):
+    one = [_slide(tmp_path, 1, 1, 1)]
+    assert len(compose_slides_into_bundles("2025타경1708", one, tmp_path)) == 1
+
+    four = [_slide(tmp_path, i, i, 1) for i in range(1, 5)]
+    assert len(compose_slides_into_bundles("2025타경1708", four, tmp_path)) == 1
+
+    five = [_slide(tmp_path, i, i, 1) for i in range(1, 6)]
+    assert len(compose_slides_into_bundles("2025타경1708", five, tmp_path)) == 2
+
+    nine = [_slide(tmp_path, i, i, 1) for i in range(1, 10)]
+    assert len(compose_slides_into_bundles("2025타경1708", nine, tmp_path)) == 3
+
+
+def test_compose_bundle_keeps_slide_order(tmp_path):
+    slides = [
+        _slide(tmp_path, 1, 2, 2),
+        _slide(tmp_path, 2, 1, 1),
+        _slide(tmp_path, 3, 2, 1),
+        _slide(tmp_path, 4, 1, 2),
+        _slide(tmp_path, 5, 3, 1),
+    ]
+    bundles = compose_slides_into_bundles("2025타경1708", slides, tmp_path)
+
+    assert [b.slide_indices for b in bundles] == [[1, 2, 3, 4], [5]]
+    assert bundles[0].source_refs == ["p1 crop1", "p1 crop2", "p2 crop1", "p2 crop2"]
+    assert bundles[1].source_refs == ["p3 crop1"]
+
+
+def test_compose_bundle_rejects_mixed_case_numbers(tmp_path):
+    slides = [
+        _slide(tmp_path, 1, 1, 1, case_number="2025타경1708"),
+        _slide(tmp_path, 2, 1, 2, case_number="2025타경9999"),
+    ]
+
+    with pytest.raises(ValueError, match="mixed case numbers"):
+        compose_slides_into_bundles("2025타경1708", slides, tmp_path)

@@ -36,7 +36,6 @@ from husik.telegram.templates import (
     AuctionFields,
     CaseMessageData,
     InterestStats,
-    build_page_caption,
     build_representative_message,
 )
 from husik.utils.text import RATING_UNKNOWN, normalize_sale_date
@@ -109,10 +108,12 @@ class CaseProcessResult:
     page_start: int
     page_end: int
     image_count: int
+    slide_count: int
     processed: bool
     reason: str = ""
     page_image_map: str = ""
     image_refs: list[str] = field(default_factory=list)
+    bundle_groups: list[str] = field(default_factory=list)
     mixed_page: bool = False
     processing_mode: str = "page/full"
 
@@ -155,13 +156,20 @@ def analyze_pdf(pdf_path: Path, work_dir: Path, openai_api_key: str | None) -> A
 
 
 def _format_page_image_refs(record: CaseRecord) -> list[str]:
-    """디버그 출력용: ["p1 crop1", "p2 crop1"] 형태로 반환한다."""
-    counts: dict[int, int] = {}
+    """디버그 출력용: 번들 소스 참조를 평탄화해서 반환한다."""
     refs: list[str] = []
     for seg in record.image_segments:
-        counts[seg.page_no] = counts.get(seg.page_no, 0) + 1
-        refs.append(f"p{seg.page_no} crop{counts[seg.page_no]}")
+        refs.extend(seg.source_refs)
     return refs
+
+
+def _format_bundle_groups(record: CaseRecord) -> list[str]:
+    groups: list[str] = []
+    for idx, seg in enumerate(record.image_segments, start=1):
+        if seg.slide_indices:
+            slide_list = ",".join(str(i) for i in seg.slide_indices)
+            groups.append(f"bundle{idx:02d}: slide {slide_list}")
+    return groups
 
 
 def dry_run_report(records: list[CaseRecord]) -> list[CaseProcessResult]:
@@ -178,10 +186,12 @@ def dry_run_report(records: list[CaseRecord]) -> list[CaseProcessResult]:
                 page_end=r.page_end,
                 status=r.status,
                 image_count=len(r.image_segments),
+                slide_count=len(r.slide_segments),
                 processed=True,
                 reason="",
                 page_image_map=", ".join(_format_page_image_refs(r)),
                 image_refs=_format_page_image_refs(r),
+                bundle_groups=_format_bundle_groups(r),
                 mixed_page=r.mixed_page_used,
                 processing_mode="page/mixed-split" if r.mixed_page_used else "page/full",
             )
@@ -319,7 +329,7 @@ def send_case_to_telegram(
     for start in range(0, len(segments), MAX_ALBUM_SIZE):
         chunk_segments = segments[start : start + MAX_ALBUM_SIZE]
         chunk_paths = [seg.image_path for seg in chunk_segments]
-        captions = [build_page_caption(seg.page_no) for seg in chunk_segments]
+        captions = ["" for _ in chunk_segments]
 
         reply_id = rep_id
         if start > 0:
@@ -566,7 +576,7 @@ def _send_review_segments(
     rep_id = sent["message_id"]
 
     paths = [seg.image_path for seg in segments]
-    captions = [build_page_caption(seg.page_no) for seg in segments]
+    captions = ["" for _ in segments]
     for start in range(0, len(paths), MAX_ALBUM_SIZE):
         chunk_paths = paths[start : start + MAX_ALBUM_SIZE]
         chunk_captions = captions[start : start + MAX_ALBUM_SIZE]
@@ -584,9 +594,15 @@ def _save_crops(analyzed: AnalyzedPdf, dest_dir: Path) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     for record in analyzed.records:
         case_dir = dest_dir / record.case_number
-        case_dir.mkdir(parents=True, exist_ok=True)
+        slides_dir = case_dir / "slides"
+        bundles_dir = case_dir / "bundles"
+        slides_dir.mkdir(parents=True, exist_ok=True)
+        bundles_dir.mkdir(parents=True, exist_ok=True)
+
+        for seg in record.slide_segments:
+            shutil.copy2(seg.image_path, slides_dir / seg.image_path.name)
         for seg in record.image_segments:
-            shutil.copy2(seg.image_path, case_dir / seg.image_path.name)
+            shutil.copy2(seg.image_path, bundles_dir / seg.image_path.name)
 
     if analyzed.review_segments:
         review_dir = dest_dir / REVIEW_LABEL

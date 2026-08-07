@@ -46,6 +46,11 @@ def test_extract_case_numbers_finds_all_spacing_variants():
     assert extract_case_numbers(text) == ["2025타경102095", "2024타경12345"]
 
 
+def test_extract_case_numbers_supports_1708_spacing_variants():
+    text = "2025타경1708, 2025 타경 1708, 2025타경 1708, 2025 타경1708"
+    assert extract_case_numbers(text) == ["2025타경1708"]
+
+
 def test_extract_case_numbers_dedup_preserves_order():
     text = "사건번호 2024타경12345 참고\n다시 2024 타경 12345\n2025타경1234"
     assert extract_case_numbers(text) == ["2024타경12345", "2025타경1234"]
@@ -104,6 +109,12 @@ def test_extract_title_candidates_removes_region_tags():
     text = "성북3 $$$ [투기과열지구 / 조정대상지역]"
     candidates = extract_title_candidates(text)
     assert candidates == ["성북3 $$$"]
+
+
+def test_extract_title_candidates_removes_blocked_phrases_even_without_brackets():
+    text = "투기과열지구 / 조정대상지역 부동산강제경매 효창공원 시프트 SSS"
+    candidates = extract_title_candidates(text)
+    assert candidates == ["효창공원 시프트 SSS"]
 
 
 def test_has_title_grade_marker_accepts_dollar_and_sss():
