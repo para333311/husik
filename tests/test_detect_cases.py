@@ -84,6 +84,15 @@ def test_title_falls_back_to_case_number_when_no_candidates():
     assert records[0].title == "2024타경1"
 
 
+def test_sale_date_is_extracted_from_case_pages():
+    pages = [
+        _page(1, case_numbers=["2025타경1708"], rating="$$$", title_candidates=["효창공원 시프트 SSS"]),
+        _page(2, case_numbers=[], text="매각기일 : 2026.05.19"),
+    ]
+    records = group_pages_into_cases(pages)
+    assert str(records[0].sale_date) == "2026-05-19"
+
+
 def test_case_number_only_no_rating_classified_as_grade_unknown():
     pages = [_page(1, case_numbers=["2025타경102095"], rating=RATING_UNKNOWN, title_candidates=[])]
     records = group_pages_into_cases(pages)

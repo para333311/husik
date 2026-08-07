@@ -10,6 +10,7 @@ import hashlib
 import logging
 import shutil
 from dataclasses import dataclass, field, fields
+from datetime import date
 from pathlib import Path
 
 from husik.auction.monitor import enrich_case
@@ -102,11 +103,14 @@ class CaseProcessResult:
     case_number: str
     rating: str
     title: str
+    sale_date: date | None
+    image_count: int
     page_start: int
     page_end: int
     processed: bool
     reason: str = ""
     page_image_map: str = ""
+    image_refs: list[str] = field(default_factory=list)
     mixed_page: bool = False
 
 
@@ -147,14 +151,14 @@ def analyze_pdf(pdf_path: Path, work_dir: Path, openai_api_key: str | None) -> A
     return analyze_pdf_pages(rendered_pages, analyses, work_dir)
 
 
-def _format_page_image_map(record: CaseRecord) -> str:
-    """디버그 출력용: "p1 crop1, p2 crop1" 형태로 이 사건이 어떤 페이지/crop에서 왔는지 보여준다."""
+def _format_page_image_refs(record: CaseRecord) -> list[str]:
+    """디버그 출력용: ["p1 crop1", "p2 crop1"] 형태로 반환한다."""
     counts: dict[int, int] = {}
-    parts: list[str] = []
+    refs: list[str] = []
     for seg in record.image_segments:
         counts[seg.page_no] = counts.get(seg.page_no, 0) + 1
-        parts.append(f"p{seg.page_no} crop{counts[seg.page_no]}")
-    return ", ".join(parts)
+        refs.append(f"p{seg.page_no} crop{counts[seg.page_no]}")
+    return refs
 
 
 def dry_run_report(records: list[CaseRecord]) -> list[CaseProcessResult]:
@@ -166,11 +170,14 @@ def dry_run_report(records: list[CaseRecord]) -> list[CaseProcessResult]:
                 case_number=r.case_number,
                 rating=r.rating,
                 title=r.title,
+                sale_date=r.sale_date,
+                image_count=len(r.image_segments),
                 page_start=r.page_start,
                 page_end=r.page_end,
                 processed=True,
                 reason="",
-                page_image_map=_format_page_image_map(r),
+                page_image_map=", ".join(_format_page_image_refs(r)),
+                image_refs=_format_page_image_refs(r),
                 mixed_page=r.mixed_page_used,
             )
         )
@@ -285,6 +292,12 @@ class _CaseTelegramResult:
     images_failed: int
 
 
+def _continue_header(case_number: str, continuation_index: int) -> str:
+    if continuation_index <= 1:
+        return f"[{case_number}-계속]"
+    return f"[{case_number}-계속 {continuation_index}]"
+
+
 def send_case_to_telegram(
     telegram: TelegramClient, channel_id: str, record: CaseRecord, message_text: str
 ) -> _CaseTelegramResult:
@@ -297,11 +310,20 @@ def send_case_to_telegram(
     image_ids: list[int] = []
     images_failed = 0
     segments = record.image_segments
+    continuation_index = 1
     for start in range(0, len(segments), MAX_ALBUM_SIZE):
         chunk_segments = segments[start : start + MAX_ALBUM_SIZE]
         chunk_paths = [seg.image_path for seg in chunk_segments]
         captions = [build_page_caption(seg.page_no) for seg in chunk_segments]
-        sent_ids, failed = _send_image_chunk(telegram, channel_id, chunk_paths, captions, rep_id)
+
+        reply_id = rep_id
+        if start > 0:
+            header_text = _continue_header(record.case_number, continuation_index)
+            followup = telegram.send_message(channel_id, header_text, parse_mode="HTML")
+            reply_id = followup["message_id"]
+            continuation_index += 1
+
+        sent_ids, failed = _send_image_chunk(telegram, channel_id, chunk_paths, captions, reply_id)
         image_ids.extend(sent_ids)
         images_failed += failed
     return _CaseTelegramResult(
@@ -310,12 +332,13 @@ def send_case_to_telegram(
 
 
 def _to_message_data(record: CaseRecord, auction_info, interest: InterestStats) -> CaseMessageData:
+    sale_date = record.sale_date or auction_info.sale_date
     auction = AuctionFields(
         court=auction_info.court or "확인중",
         address=auction_info.address or "확인중",
         appraisal_price=auction_info.appraisal_price,
         min_price=auction_info.min_price,
-        sale_date=auction_info.sale_date,
+        sale_date=sale_date,
         status=auction_info.status or "확인중",
         winning_price=auction_info.winning_price,
         winning_rate=auction_info.winning_rate,
@@ -329,7 +352,7 @@ def _to_message_data(record: CaseRecord, auction_info, interest: InterestStats) 
         title=record.title,
         auction=auction,
         interest=interest,
-        image_count=len(record.pages),
+        image_count=len(record.image_segments),
     )
 
 

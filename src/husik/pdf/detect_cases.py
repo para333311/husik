@@ -19,11 +19,13 @@ $/$$ 수준으로만 잡히면 "낮은등급"으로 분류한다 (utils.text.cla
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 from husik.pdf.ocr import extract_page_text, openai_vision_case_numbers
 from husik.pdf.render import RenderedPage
 from husik.pdf.segment import REVIEW_LABEL, ImageSegment, segment_page
+from husik.utils.dates import parse_sale_date_from_text
 from husik.utils.text import (
     RATING_3,
     RATING_4,
@@ -69,6 +71,7 @@ class CaseRecord:
     title: str
     page_start: int
     page_end: int
+    sale_date: date | None = None
     pages: list[PageAnalysis] = field(default_factory=list)
     image_segments: list[ImageSegment] = field(default_factory=list)
 
@@ -113,6 +116,14 @@ def _pick_title(pages: list[PageAnalysis], fallback: str) -> str:
     return fallback
 
 
+def _pick_sale_date(pages: list[PageAnalysis]) -> date | None:
+    for page in pages:
+        found = parse_sale_date_from_text(page.raw_text)
+        if found is not None:
+            return found
+    return None
+
+
 def _pick_rating_label(pages: list[PageAnalysis]) -> str:
     """사건 시작 페이지 주변(RATING_LOOKAHEAD_PAGES)에서 가장 높은 등급을 고른다.
 
@@ -151,6 +162,7 @@ def group_pages_into_cases(pages: list[PageAnalysis]) -> list[CaseRecord]:
     for record in records:
         record.rating = _pick_rating_label(record.pages)
         record.title = _pick_title(record.pages, fallback=record.case_number)
+        record.sale_date = _pick_sale_date(record.pages)
 
     return records
 
@@ -246,6 +258,7 @@ def assign_image_segments(
                     title=seg.case_number,
                     page_start=seg.page_no,
                     page_end=seg.page_no,
+                    sale_date=None,
                 )
                 records.append(record)
                 by_case[seg.case_number] = record

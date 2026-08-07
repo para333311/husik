@@ -62,18 +62,24 @@ def cmd_process_local_pdf(args: argparse.Namespace) -> int:
         pdf_path, config, state, send=args.send, tmp_root=tmp_root, save_crops_dir=save_crops_dir
     )
 
-    header = f"{'사건번호':<16}{'달러등급':<10}{'제목':<24}{'페이지범위':<12}{'처리 여부':<8}{'혼합페이지'}"
-    print(header)
-    for r in report.results:
-        status = "처리" if r.processed else (f"버림({r.reason})" if r.reason else "버림")
-        page_range = f"{r.page_start}-{r.page_end}p"
-        mixed = "true" if r.mixed_page else "false"
-        print(f"{r.case_number:<16}{r.rating:<10}{r.title[:22]:<24}{page_range:<12}{status:<8}{mixed}")
-        if args.debug_layout and r.page_image_map:
-            print(f"  페이지/이미지: {r.page_image_map}")
+    for idx, r in enumerate(report.results):
+        print(f"사건번호: {r.case_number}")
+        print(f"제목: {r.title}")
+        if r.sale_date is not None:
+            sale_date = f"{r.sale_date.year}.{r.sale_date.month}.{r.sale_date.day}"
+        else:
+            sale_date = ""
+        print(f"매각기일: {sale_date}")
+        print(f"이미지: {r.image_count}장")
+        if args.debug_layout:
+            print("이미지범위:")
+            for ref in r.image_refs:
+                print(f"- {ref}")
+        if idx < len(report.results) - 1:
+            print()
 
     if report.review_page_count:
-        print(f"\n검토필요(사건 구분 불확실): {report.review_page_count}장 (다른 사건에 섞지 않고 별도 전송)")
+        print(f"\n검토필요(사건 구분 불확실): {report.review_page_count}장")
 
     if save_crops_dir is not None:
         print(f"\ncrop 이미지 저장 위치: {save_crops_dir}")

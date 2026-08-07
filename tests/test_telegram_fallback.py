@@ -83,23 +83,61 @@ def test_send_photo_with_fallback_returns_none_when_everything_fails(tmp_path):
     assert result is None
 
 
-def test_send_case_to_telegram_uses_html_parse_mode(tmp_path):
-    client = FakeTelegramClient()
-    client.media_group_should_fail = False
-    image_path = _make_image(tmp_path / "p1.jpg")
-    record = CaseRecord(
+def _build_record_with_images(tmp_path, image_count: int) -> CaseRecord:
+    segments = []
+    for i in range(image_count):
+        path = _make_image(tmp_path / f"p{i + 1}.jpg")
+        segments.append(ImageSegment(case_number="2025타경102095", page_no=i + 1, image_path=path))
+    return CaseRecord(
         case_number="2025타경102095",
         rating="$$$",
         title="사당 15 추천 $$$",
         page_start=1,
-        page_end=1,
-        image_segments=[
-            ImageSegment(case_number="2025타경102095", page_no=1, image_path=image_path)
-        ],
+        page_end=max(1, image_count),
+        image_segments=segments,
     )
+
+
+def test_send_case_to_telegram_uses_html_parse_mode(tmp_path):
+    client = FakeTelegramClient()
+    client.media_group_should_fail = False
+    record = _build_record_with_images(tmp_path, 1)
 
     send_case_to_telegram(client, "-100123", record, "<b>본문</b>")
 
     assert len(client.send_message_calls) == 1
     _, _, parse_mode = client.send_message_calls[0]
     assert parse_mode == "HTML"
+
+
+def test_no_continue_message_when_images_not_exceed_10(tmp_path):
+    client = FakeTelegramClient()
+    client.media_group_should_fail = False
+    record = _build_record_with_images(tmp_path, 10)
+
+    send_case_to_telegram(client, "-100123", record, "대표")
+
+    texts = [call[1] for call in client.send_message_calls]
+    assert texts == ["대표"]
+
+
+def test_continue_message_created_when_images_exceed_10(tmp_path):
+    client = FakeTelegramClient()
+    client.media_group_should_fail = False
+    record = _build_record_with_images(tmp_path, 11)
+
+    send_case_to_telegram(client, "-100123", record, "대표")
+
+    texts = [call[1] for call in client.send_message_calls]
+    assert texts == ["대표", "[2025타경102095-계속]"]
+
+
+def test_multiple_continue_messages_for_21_plus_images(tmp_path):
+    client = FakeTelegramClient()
+    client.media_group_should_fail = False
+    record = _build_record_with_images(tmp_path, 21)
+
+    send_case_to_telegram(client, "-100123", record, "대표")
+
+    texts = [call[1] for call in client.send_message_calls]
+    assert texts == ["대표", "[2025타경102095-계속]", "[2025타경102095-계속 2]"]

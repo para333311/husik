@@ -1,24 +1,16 @@
-"""텔레그램 대표 메시지 / 업데이트 메시지 텍스트 빌더.
-
-가독성을 위해 값이 없는 항목("확인중"/None/0)은 아예 줄을 숨기고, 핵심 항목만
-보여준다. "확인중"은 상태/입찰일/등급처럼 꼭 필요한 곳에만 최소로 쓴다.
-링크는 긴 URL을 그대로 노출하지 않고 HTML 앵커(<a href="...">텍스트</a>)로
-감싼다 — 호출자는 반드시 parse_mode="HTML"로 전송해야 한다.
-"""
+"""텔레그램 대표 메시지 / 업데이트 메시지 텍스트 빌더."""
 from __future__ import annotations
 
 import html
 from dataclasses import dataclass, field
 from datetime import date
 
-from husik.utils.dates import format_deadline_label
+from husik.utils.dates import format_compact_date
 from husik.utils.money import format_money, format_rate
 
 MESSAGE_LIMIT = 3800
 DIVIDER = "-" * 20
 UNKNOWN = "확인중"
-# 달러 기호 등급은 제목 앞에 그대로 붙이고, 그 외(낮은등급/등급확인)는 대괄호로 감싼다.
-DOLLAR_SIGN_RATINGS = {"$$$", "$$$$", "$$$$$"}
 
 
 def _is_known(value: str | None) -> bool:
@@ -95,66 +87,22 @@ def auction_fields_from_dict(data: dict) -> AuctionFields:
 
 
 def build_header(data: CaseMessageData, event_tag: str | None = None) -> str:
-    deadline = format_deadline_label(data.auction.sale_date)
-    rating = data.rating or "등급확인"
-    rating_part = rating if rating in DOLLAR_SIGN_RATINGS else f"[{_esc(rating)}]"
-    base = f"[{deadline}] {rating_part} {_esc(data.case_number)}"
-    return f"[{_esc(event_tag)}] {base}" if event_tag else base
+    base = f"[{_esc(data.case_number)}]"
+    if not event_tag:
+        return base
+    return f"[{_esc(event_tag)}] {base}"
 
 
 def build_body(data: CaseMessageData, update_log: list[str] | None = None) -> str:
     a = data.auction
-    i = data.interest
-    lines: list[str] = [f"사건번호: {_esc(data.case_number)}"]
+    sale_date = format_compact_date(a.sale_date)
+    lines: list[str] = []
 
     if data.title and data.title != data.case_number:
-        lines.append(f"제목: {_esc(data.title)}")
-    if _is_known(data.item_number):
-        lines.append(f"물건번호: {_esc(data.item_number)}")
-    if _is_known(a.court):
-        lines.append(f"법원: {_esc(a.court)}")
-    if _is_known(a.address):
-        lines.append(f"소재지: {_esc(a.address)}")
-    if a.appraisal_price is not None:
-        lines.append(f"감정가: {format_money(a.appraisal_price)}")
-    if a.min_price is not None:
-        lines.append(f"최저가: {format_money(a.min_price)}")
-    if a.sale_date is not None:
-        lines.append(f"매각기일: {a.sale_date.isoformat()}")
-    lines.append(f"상태: {_esc(a.status or UNKNOWN)}")
-
-    interest_lines = []
-    if i.court_views is not None:
-        interest_lines.append(f"- 법원경매 조회수: {i.court_views}")
-    if i.madangs_views is not None:
-        interest_lines.append(f"- 경매마당 조회수: {i.madangs_views}")
-    if i.blog_mentions:
-        interest_lines.append(f"- 블로그 언급: {i.blog_mentions}")
-    if i.recent_blog_mentions:
-        interest_lines.append(f"- 최근 7일 신규 블로그: {i.recent_blog_mentions}")
-    if interest_lines:
-        lines.append("")
-        lines.append("관심도:")
-        lines.extend(interest_lines)
-
-    link_lines = []
-    if a.madangs_link and a.madangs_link.startswith("http"):
-        link_lines.append(f'- <a href="{_esc_attr(a.madangs_link)}">경매마당</a>')
-    if a.court_link and a.court_link.startswith("http"):
-        link_lines.append(f'- <a href="{_esc_attr(a.court_link)}">법원경매</a>')
-    if link_lines:
-        lines.append("")
-        lines.append("링크:")
-        lines.extend(link_lines)
-
-    lines.append("")
-    lines.append(f"첨부 이미지: {data.image_count}장")
-
-    if update_log:
-        lines.append("")
-        lines.append("업데이트:")
-        lines.extend(f"- {_esc(entry)}" for entry in update_log)
-
+        lines.append(_esc(data.title))
+    lines.append(f"ㅇ 매각기일 : {sale_date}")
+    lines.append("ㅇ 상태 :")
+    lines.append(f"ㅇ 이미지 {data.image_count}장")
     return "\n".join(lines)
 
 
@@ -180,7 +128,7 @@ def truncate_message(text: str, limit: int = MESSAGE_LIMIT) -> str:
 
 
 def build_representative_message(data: CaseMessageData) -> str:
-    text = build_header(data) + "\n\n" + build_body(data, update_log=["최초 등록"])
+    text = build_header(data) + "\n" + build_body(data)
     return truncate_message(text)
 
 

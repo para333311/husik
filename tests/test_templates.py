@@ -3,7 +3,6 @@ from datetime import date
 from husik.telegram.templates import (
     AuctionFields,
     CaseMessageData,
-    InterestStats,
     build_award_update,
     build_event_update,
     build_representative_message,
@@ -11,99 +10,80 @@ from husik.telegram.templates import (
 )
 
 
-def test_representative_message_header_unknown_date():
-    data = CaseMessageData(case_number="2024타경12345", rating="$$$$", title="강남 아파트 특급매물")
-    text = build_representative_message(data)
-    assert text.startswith("[입찰일 확인중] $$$$ 2024타경12345")
-    assert "출처: 매수맛집" not in text
-    assert "PDF 첨부" not in text
-
-
-def test_representative_message_header_with_sale_date():
+def test_representative_message_simple_format():
     data = CaseMessageData(
-        case_number="2024타경12345",
-        rating="$$$$",
-        title="강남 아파트 특급매물",
-        auction=AuctionFields(sale_date=date(2026, 8, 20)),
+        case_number="2025타경1708",
+        rating="$$$",
+        title="효창공원 시프트 SSS",
+        auction=AuctionFields(sale_date=date(2026, 5, 19)),
+        image_count=3,
     )
+
     text = build_representative_message(data)
-    assert text.startswith("[2026-08-20 입찰 D-")
-    assert "$$$$ 2024타경12345" in text.splitlines()[0]
-    # 제목은 헤더가 아니라 본문의 "제목:" 줄에 나온다.
-    assert "제목: 강남 아파트 특급매물" in text
+
+    assert text == "\n".join(
+        [
+            "[2025타경1708]",
+            "효창공원 시프트 SSS",
+            "ㅇ 매각기일 : 2026.5.19",
+            "ㅇ 상태 :",
+            "ㅇ 이미지 3장",
+        ]
+    )
 
 
-def test_representative_message_shows_only_known_fields():
+def test_representative_message_keeps_sale_date_line_empty_when_missing():
     data = CaseMessageData(
-        case_number="2024타경12345",
-        rating="$$$$",
-        title="제목",
-        interest=InterestStats(court_views=10, madangs_views=5, blog_mentions=2, recent_blog_mentions=1),
+        case_number="2025타경1708",
+        rating="$$$",
+        title="효창공원 시프트 SSS",
+        image_count=1,
     )
+
     text = build_representative_message(data)
-    for field in [
-        "사건번호:",
-        "상태:",
-        "관심도:",
-        "법원경매 조회수:",
-        "경매마당 조회수:",
-        "블로그 언급:",
-        "최근 7일 신규 블로그:",
-        "첨부 이미지:",
-    ]:
-        assert field in text
-    # 값이 없는 항목(법원/소재지/감정가/최저가/매각기일/물건번호/링크)은 아예 숨긴다.
-    for hidden_field in ["법원:", "소재지:", "감정가:", "최저가:", "매각기일:", "물건번호:", "링크:"]:
-        assert hidden_field not in text
+
+    assert "ㅇ 매각기일 : " in text
+    assert "ㅇ 매각기일 :\n" not in text
 
 
-def test_representative_message_shows_present_fields_and_html_links():
+def test_representative_message_omits_title_when_missing():
+    data = CaseMessageData(case_number="2025타경1708", rating="$$$", title="2025타경1708", image_count=2)
+
+    text = build_representative_message(data)
+
+    assert text.splitlines()[0] == "[2025타경1708]"
+    assert len(text.splitlines()) == 4
+
+
+def test_representative_message_removes_interest_links_notion_phrases():
     data = CaseMessageData(
-        case_number="2024타경12345",
-        rating="$$$$",
-        title="제목",
-        auction=AuctionFields(
-            court="서울중앙지방법원",
-            address="서울시 강남구",
-            appraisal_price=500_000_000,
-            madangs_link="https://www.madangs.com/search?keyword=2024타경12345",
-            court_link="https://www.courtauction.go.kr/pgj/index.on",
-        ),
+        case_number="2025타경1708",
+        rating="$$$",
+        title="효창공원 시프트 SSS",
+        image_count=3,
     )
+
     text = build_representative_message(data)
-    assert "법원: 서울중앙지방법원" in text
-    assert "소재지: 서울시 강남구" in text
-    assert "감정가: 500,000,000원" in text
-    assert "링크:" in text
-    assert '<a href="https://www.madangs.com/search?keyword=2024타경12345">경매마당</a>' in text
-    assert '<a href="https://www.courtauction.go.kr/pgj/index.on">법원경매</a>' in text
-    # 긴 URL이 그대로 노출되면 안 된다.
-    assert "https://www.madangs.com" not in text.split("링크:")[0]
 
-
-def test_representative_message_header_low_grade_uses_brackets():
-    data = CaseMessageData(case_number="2024타경1", rating="낮은등급", title="제목")
-    text = build_representative_message(data)
-    assert text.startswith("[입찰일 확인중] [낮은등급] 2024타경1")
-
-
-def test_representative_message_header_grade_unknown_uses_brackets():
-    data = CaseMessageData(case_number="2024타경1", rating="등급확인", title="제목")
-    text = build_representative_message(data)
-    assert text.startswith("[입찰일 확인중] [등급확인] 2024타경1")
-
-
-def test_representative_message_header_dollar_rating_not_bracketed():
-    data = CaseMessageData(case_number="2024타경1", rating="$$$", title="사당 15 추천 $$$")
-    text = build_representative_message(data)
-    assert text.startswith("[입찰일 확인중] $$$ 2024타경1")
-    assert "[$$$]" not in text
+    banned = [
+        "관심도",
+        "법원경매 조회수",
+        "경매마당 조회수",
+        "블로그 언급",
+        "최근 7일 신규 블로그",
+        "경매마당",
+        "법원경매",
+        "Notion 상세페이지 참고",
+        "이미지 안내: 아래 첨부 이미지",
+    ]
+    for token in banned:
+        assert token not in text
 
 
 def test_event_update_prepends_new_block_above_existing():
     data = CaseMessageData(case_number="2024타경12345", rating="$$$$", title="제목")
     updated = build_event_update("블로그업데이트", data, existing_message="옛날 대표 메시지")
-    assert updated.startswith("[블로그업데이트]")
+    assert updated.startswith("[블로그업데이트] [2024타경12345]")
     assert updated.index("블로그업데이트") < updated.index("옛날 대표 메시지")
     assert "기존 내용" in updated
 
