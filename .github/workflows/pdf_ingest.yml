@@ -41,6 +41,8 @@ jobs:
           TELEGRAM_AUDIO_CHANNEL_ID: ${{ secrets.TELEGRAM_AUDIO_CHANNEL_ID }}
           TELEGRAM_ALLOWED_USER_ID: ${{ secrets.TELEGRAM_ALLOWED_USER_ID }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: gemini-2.5-flash
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_AUCTION_DB_URL: ${{ secrets.NOTION_AUCTION_DB_URL }}
           NOTION_HUSIK_DB_ID: ${{ secrets.NOTION_HUSIK_DB_ID }}
