@@ -156,3 +156,13 @@ def test_compose_bundle_rejects_mixed_case_numbers(tmp_path):
 
     with pytest.raises(ValueError, match="mixed case numbers"):
         compose_slides_into_bundles("2025타경1708", slides, tmp_path)
+
+
+def test_bundle_image_is_single_vertical_column(tmp_path):
+    slides = [_slide(tmp_path, i, i, 1) for i in range(1, 5)]
+    bundles = compose_slides_into_bundles("2025타경1708", slides, tmp_path)
+
+    assert len(bundles) == 1
+    with Image.open(bundles[0].image_path) as out_img:
+        assert out_img.width == 1800
+        assert out_img.height > out_img.width

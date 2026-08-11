@@ -62,6 +62,20 @@ def cmd_process_local_pdf(args: argparse.Namespace) -> int:
         pdf_path, config, state, send=args.send, tmp_root=tmp_root, save_crops_dir=save_crops_dir
     )
 
+    if args.debug_layout and report.pages:
+        for page in report.pages:
+            print(f"페이지 {page.page_no}:")
+            print(f"- source: {page.source}")
+            if page.case_numbers:
+                print(f"- 사건번호: {', '.join(page.case_numbers)}")
+            if page.title:
+                print(f"- 제목: {page.title}")
+            if page.sale_date:
+                print(f"- 매각기일: {page.sale_date}")
+            if page.status:
+                print(f"- 상태: {page.status}")
+            print(f"- confidence: {page.confidence:.2f}")
+
     for idx, r in enumerate(report.results):
         print(f"사건번호: {r.case_number}")
         print(f"제목: {r.title}")
@@ -83,6 +97,9 @@ def cmd_process_local_pdf(args: argparse.Namespace) -> int:
 
     if report.review_page_count:
         print(f"\n검토필요(사건 구분 불확실): {report.review_page_count}장")
+        if args.debug_layout:
+            for ref in report.review_refs:
+                print(f"- {ref}")
 
     if save_crops_dir is not None:
         print(f"\ncrop 이미지 저장 위치: {save_crops_dir}")

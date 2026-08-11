@@ -27,7 +27,7 @@ from husik.pdf.detect_cases import (
     analyze_pdf_pages,
 )
 from husik.pdf.render import render_pdf_to_images
-from husik.pdf.segment import REVIEW_LABEL, ImageSegment
+from husik.pdf.segment import REVIEW_LABEL, ImageSegment, compose_slides_into_bundles
 from husik.state.store import CaseState, StateStore
 from husik.telegram.client import TelegramClient, TelegramError
 from husik.telegram.commands import handle_bot_command
@@ -39,6 +39,8 @@ from husik.telegram.templates import (
     build_representative_message,
 )
 from husik.utils.text import RATING_UNKNOWN, normalize_sale_date
+from husik.vision.base import VisionCache
+from husik.vision.gemini import GeminiVisionProvider
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +92,8 @@ class IngestStats:
     no_case_number_pdfs: int = 0
     no_rating_cases: int = 0
     ocr_failed_pdfs: int = 0
+    vision_cache_hits: int = 0
+    vision_cache_misses: int = 0
 
     def log_summary(self) -> None:
         logger.info("===== husik pdf ingest summary =====")
@@ -149,9 +153,22 @@ def hash_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def analyze_pdf(pdf_path: Path, work_dir: Path, openai_api_key: str | None) -> AnalyzedPdf:
+def analyze_pdf(pdf_path: Path, work_dir: Path, config: Config) -> AnalyzedPdf:
     rendered_pages = render_pdf_to_images(pdf_path, work_dir)
-    analyses: list[PageAnalysis] = [analyze_page(p, openai_api_key) for p in rendered_pages]
+    vision_provider = GeminiVisionProvider(config.gemini_api_key, config.gemini_model)
+    vision_cache = VisionCache(config.state_dir)
+    pdf_hash = hash_file(pdf_path)
+    analyses: list[PageAnalysis] = [
+        analyze_page(
+            p,
+            config.openai_api_key,
+            vision_provider=vision_provider,
+            vision_cache=vision_cache,
+            pdf_hash=pdf_hash,
+            work_dir=work_dir,
+        )
+        for p in rendered_pages
+    ]
     return analyze_pdf_pages(rendered_pages, analyses, work_dir)
 
 
@@ -492,17 +509,20 @@ def process_pdf_and_send(
     work_dir = tmp_root / f"work_{hash_file(pdf_path)[:12]}"
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        rendered_pages = render_pdf_to_images(pdf_path, work_dir)
-        stats.pages_rendered += len(rendered_pages)
-        analyses = [analyze_page(p, config.openai_api_key) for p in rendered_pages]
-        analyzed = analyze_pdf_pages(rendered_pages, analyses, work_dir)
+        analyzed = analyze_pdf(pdf_path, work_dir, config)
         records = analyzed.records
+        analyses = analyzed.analyses
+
+        stats.pages_rendered += len(analyses)
+        stats.vision_cache_hits += sum(1 for a in analyses if a.source.startswith("gemini(cache)"))
+        stats.vision_cache_misses += sum(1 for a in analyses if a.source == "gemini")
+
         result.detected_cases = len(records)
         stats.detected_cases += len(records)
 
         if not records:
             non_empty_pages = sum(1 for a in analyses if len(a.raw_text.strip()) >= MIN_TEXT_FOR_OCR_SUCCESS)
-            if rendered_pages and non_empty_pages == 0:
+            if analyses and non_empty_pages == 0:
                 stats.ocr_failed_pdfs += 1
                 stats.errors_count += 1
                 result.ocr_failed = True
@@ -548,7 +568,12 @@ def process_pdf_and_send(
         # 확신이 낮아 특정 사건에 못 붙인 이미지는 절대 섞지 않고 "검토필요"로 따로 보낸다.
         if analyzed.review_segments and not result.channel_send_failed:
             try:
-                _send_review_segments(telegram, config.telegram_auction_channel_id, analyzed.review_segments)
+                _send_review_segments(
+                    telegram,
+                    config.telegram_auction_channel_id,
+                    analyzed.review_segments,
+                    work_dir,
+                )
             except Exception:
                 logger.exception("failed to send review segments")
                 stats.errors_count += 1
@@ -562,21 +587,28 @@ def process_pdf_and_send(
 
 
 def _send_review_segments(
-    telegram: TelegramClient, channel_id: str, segments: list[ImageSegment]
+    telegram: TelegramClient,
+    channel_id: str,
+    segments: list[ImageSegment],
+    work_dir: Path,
 ) -> None:
     """사건 구분이 불확실한 이미지는 특정 사건에 붙이지 않고 별도 메시지로 보낸다.
 
-    다른 사건 이미지와 절대 섞이면 안 되므로, 확신이 없을 땐 이렇게 따로 보내는
-    쪽을 택한다 (요구사항: "확신이 낮으면 차라리 해당 이미지를 검토필요로 따로 보내세요").
+    review도 4슬라이드 세로 합성으로 전송한다.
     """
     pages = sorted({seg.page_no for seg in segments})
-    page_list = ", ".join(f"p{p}" for p in pages)
-    header = f"[검토필요] 사건 구분이 불확실한 페이지 ({page_list})"
+    page_list = ", ".join(f"page {p}" for p in pages)
+    header = "[검토필요]\n사건번호 인식 불확실"
+    if page_list:
+        header += f"\n· {page_list}"
     sent = telegram.send_message(channel_id, header, parse_mode="HTML")
     rep_id = sent["message_id"]
 
-    paths = [seg.image_path for seg in segments]
-    captions = ["" for _ in segments]
+    ordered = sorted(segments, key=lambda s: (s.page_no, s.order_index))
+    bundles = compose_slides_into_bundles(REVIEW_LABEL, ordered, work_dir)
+
+    paths = [seg.image_path for seg in bundles]
+    captions = ["" for _ in bundles]
     for start in range(0, len(paths), MAX_ALBUM_SIZE):
         chunk_paths = paths[start : start + MAX_ALBUM_SIZE]
         chunk_captions = captions[start : start + MAX_ALBUM_SIZE]
@@ -584,9 +616,22 @@ def _send_review_segments(
 
 
 @dataclass
+class DryRunPageReport:
+    page_no: int
+    source: str
+    case_numbers: list[str]
+    title: str | None
+    sale_date: str | None
+    status: str | None
+    confidence: float
+
+
+@dataclass
 class DryRunReport:
     results: list[CaseProcessResult]
     review_page_count: int = 0
+    pages: list[DryRunPageReport] = field(default_factory=list)
+    review_refs: list[str] = field(default_factory=list)
 
 
 def _save_crops(analyzed: AnalyzedPdf, dest_dir: Path) -> None:
@@ -623,22 +668,47 @@ def process_pdf(
     work_dir = tmp_root / f"work_{hash_file(pdf_path)[:12]}"
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        analyzed = analyze_pdf(pdf_path, work_dir, config.openai_api_key)
+        analyzed = analyze_pdf(pdf_path, work_dir, config)
         results = dry_run_report(analyzed.records)
         review_count = len(analyzed.review_segments)
+        pages: list[DryRunPageReport] = []
+        for analysis in analyzed.analyses:
+            pages.append(
+                DryRunPageReport(
+                    page_no=analysis.page_no,
+                    source=analysis.source,
+                    case_numbers=analysis.page_case_numbers,
+                    title=(analysis.title_candidates[0] if analysis.title_candidates else None),
+                    sale_date=normalize_sale_date(analysis.sale_date_hint),
+                    status=analysis.status,
+                    confidence=analysis.confidence,
+                )
+            )
+        review_refs = sorted(
+            {
+                ref
+                for seg in analyzed.review_segments
+                for ref in (seg.source_refs or [f"page {seg.page_no}"])
+            }
+        )
 
         if save_crops_dir is not None:
             _save_crops(analyzed, save_crops_dir)
 
         if not send:
-            return DryRunReport(results=results, review_page_count=review_count)
+            return DryRunReport(
+                results=results,
+                review_page_count=review_count,
+                pages=pages,
+                review_refs=review_refs,
+            )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
     stats = IngestStats()
     process_pdf_and_send(pdf_path, config, state, tmp_root, stats)
     stats.log_summary()
-    return DryRunReport(results=results, review_page_count=review_count)
+    return DryRunReport(results=results, review_page_count=review_count, pages=pages, review_refs=review_refs)
 
 
 def poll_and_ingest(config: Config, state: StateStore) -> IngestStats:

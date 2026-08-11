@@ -20,7 +20,6 @@ REQUIRED_ENV_VARS: list[str] = [
     "TELEGRAM_AUCTION_CHANNEL_ID",
     "TELEGRAM_AUDIO_CHANNEL_ID",
     "TELEGRAM_ALLOWED_USER_ID",
-    "OPENAI_API_KEY",
     "NOTION_TOKEN",
     "NAVER_CLIENT_ID",
     "NAVER_CLIENT_SECRET",
@@ -52,6 +51,8 @@ class Config:
     court_auction_enabled: bool
     madangs_enabled: bool
     blog_monitor_enabled: bool
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
     state_dir: Path = field(default_factory=lambda: Path("data/state"))
     tmp_dir: Path = field(default_factory=lambda: Path("data/tmp"))
 
@@ -68,6 +69,8 @@ class Config:
             notion_token=os.environ.get("NOTION_TOKEN", ""),
             notion_auction_db_url=notion_db_url,
             naver_client_id=os.environ.get("NAVER_CLIENT_ID", ""),
+            gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
+            gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
             naver_client_secret=os.environ.get("NAVER_CLIENT_SECRET", ""),
             court_auction_enabled=_bool_env("COURT_AUCTION_ENABLED", True),
             madangs_enabled=_bool_env("MADANGS_ENABLED", True),

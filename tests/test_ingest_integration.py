@@ -94,7 +94,7 @@ def test_case_number_without_rating_is_still_processed_and_gets_its_own_images(t
     assert "p3" not in by_case["2024타경12345"].page_image_map
 
 
-def test_single_case_multiple_pages_are_merged_into_one_image(tmp_path):
+def test_page_without_case_number_is_not_forced_to_previous_case(tmp_path):
     pdf_path = tmp_path / "single_case_multi_page.pdf"
     doc = fitz.open()
     font = fitz.Font("korea")
@@ -119,7 +119,7 @@ def test_single_case_multiple_pages_are_merged_into_one_image(tmp_path):
     assert len(report.results) == 1
     result = report.results[0]
     assert result.case_number == "2025타경13320"
-    assert result.page_start == 1 and result.page_end == 2
+    assert result.page_start == 1 and result.page_end == 1
     assert result.image_count == 1
     assert result.processing_mode == "page/full"
 
