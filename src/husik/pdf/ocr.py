@@ -1,10 +1,10 @@
-"""페이지 텍스트 추출: PyMuPDF native 텍스트 -> 영역 OCR(Tesseract) -> OpenAI Vision fallback."""
+"""페이지 텍스트 추출: PyMuPDF native 텍스트 -> 영역 OCR(Tesseract) -> (opt-in) OpenAI Vision fallback."""
 from __future__ import annotations
 
 import base64
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
 
@@ -39,6 +39,30 @@ class VisionCaseResult:
     sale_date: date | None = None
     status: str | None = None
     confidence: float = 0.0
+
+
+@dataclass
+class OcrRuntimeStats:
+    openai_vision_calls: int = 0
+
+
+_RUNTIME_STATS = OcrRuntimeStats()
+
+
+def reset_ocr_runtime_stats() -> None:
+    _RUNTIME_STATS.openai_vision_calls = 0
+
+
+def get_ocr_runtime_stats() -> dict[str, int]:
+    return asdict(_RUNTIME_STATS)
+
+
+def _record_openai_call() -> None:
+    _RUNTIME_STATS.openai_vision_calls += 1
+
+
+def _openai_vision_allowed(api_key: str | None, enabled: bool) -> bool:
+    return bool(enabled and (api_key or "").strip())
 
 
 def _safe_openai_chat(payload: dict, api_key: str, timeout: int) -> str:
@@ -93,10 +117,16 @@ def tesseract_ocr_regions(
     return outputs
 
 
-def openai_vision_ocr(image_path: Path, api_key: str, timeout: int = 60) -> str:
+def openai_vision_ocr(
+    image_path: Path,
+    api_key: str,
+    timeout: int = 60,
+    enabled: bool = False,
+) -> str:
     """OPENAI_API_KEY는 호출자에서만 전달되며 이 함수는 값을 로그로 남기지 않는다."""
-    if not api_key:
+    if not _openai_vision_allowed(api_key, enabled):
         return ""
+    _record_openai_call()
     try:
         b64 = _read_image_as_b64(image_path)
         return _safe_openai_chat(
@@ -133,10 +163,16 @@ VISION_CASE_NUMBER_PROMPT = (
 )
 
 
-def openai_vision_case_numbers(image_path: Path, api_key: str, timeout: int = 60) -> list[str]:
+def openai_vision_case_numbers(
+    image_path: Path,
+    api_key: str,
+    timeout: int = 60,
+    enabled: bool = False,
+) -> list[str]:
     """텍스트 기반 인식이 불안정할 때 Vision에게 사건번호 목록만 JSON으로 물어본다."""
-    if not api_key:
+    if not _openai_vision_allowed(api_key, enabled):
         return []
+    _record_openai_call()
     try:
         b64 = _read_image_as_b64(image_path)
         content = _safe_openai_chat(
@@ -194,10 +230,16 @@ VISION_CASE_METADATA_PROMPT = (
 )
 
 
-def openai_vision_case_metadata(image_path: Path, api_key: str, timeout: int = 60) -> VisionCaseResult:
+def openai_vision_case_metadata(
+    image_path: Path,
+    api_key: str,
+    timeout: int = 60,
+    enabled: bool = False,
+) -> VisionCaseResult:
     """사건번호/제목/매각기일/상태만 최소 JSON으로 추출한다. 실패 시 기본값 반환."""
-    if not api_key:
+    if not _openai_vision_allowed(api_key, enabled):
         return VisionCaseResult()
+    _record_openai_call()
 
     try:
         b64 = _read_image_as_b64(image_path)
@@ -267,7 +309,12 @@ def openai_vision_case_metadata(image_path: Path, api_key: str, timeout: int = 6
         return VisionCaseResult()
 
 
-def extract_page_text(image_path: Path, native_text: str, openai_api_key: str | None = None) -> str:
+def extract_page_text(
+    image_path: Path,
+    native_text: str,
+    openai_api_key: str | None = None,
+    openai_vision_enabled: bool = False,
+) -> str:
     text = (native_text or "").strip()
     if len(text) >= MIN_TEXT_LENGTH:
         return text
@@ -276,8 +323,12 @@ def extract_page_text(image_path: Path, native_text: str, openai_api_key: str | 
     if len(ocr_text) >= MIN_TEXT_LENGTH:
         return ocr_text
 
-    if openai_api_key:
-        vision_text = openai_vision_ocr(image_path, openai_api_key)
+    if _openai_vision_allowed(openai_api_key, openai_vision_enabled):
+        vision_text = openai_vision_ocr(
+            image_path,
+            openai_api_key,
+            enabled=openai_vision_enabled,
+        )
         if vision_text:
             return vision_text
 

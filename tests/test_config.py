@@ -76,3 +76,27 @@ def test_config_from_env_uses_legacy_when_new_missing(monkeypatch):
     monkeypatch.setenv("NOTION_HUSIK_DB_ID", "legacy-id")
     config = Config.from_env()
     assert config.notion_auction_db_url == "legacy-id"
+
+
+def test_openai_vision_disabled_by_default(monkeypatch):
+    from husik.config import Config
+
+    _clear_husik_env(monkeypatch)
+    _set_all_required(monkeypatch)
+    monkeypatch.setenv("NOTION_AUCTION_DB_URL", "db-url")
+    config = Config.from_env()
+
+    assert config.openai_api_key == "x"
+    assert config.openai_vision_enabled is False
+
+
+def test_openai_vision_enabled_only_when_env_true(monkeypatch):
+    from husik.config import Config
+
+    _clear_husik_env(monkeypatch)
+    _set_all_required(monkeypatch)
+    monkeypatch.setenv("NOTION_AUCTION_DB_URL", "db-url")
+    monkeypatch.setenv("OPENAI_VISION_ENABLED", "true")
+    config = Config.from_env()
+
+    assert config.openai_vision_enabled is True

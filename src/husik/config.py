@@ -53,6 +53,7 @@ class Config:
     blog_monitor_enabled: bool
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
+    openai_vision_enabled: bool = False
     state_dir: Path = field(default_factory=lambda: Path("data/state"))
     tmp_dir: Path = field(default_factory=lambda: Path("data/tmp"))
 
@@ -71,6 +72,7 @@ class Config:
             naver_client_id=os.environ.get("NAVER_CLIENT_ID", ""),
             gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
             gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+            openai_vision_enabled=_bool_env("OPENAI_VISION_ENABLED", False),
             naver_client_secret=os.environ.get("NAVER_CLIENT_SECRET", ""),
             court_auction_enabled=_bool_env("COURT_AUCTION_ENABLED", True),
             madangs_enabled=_bool_env("MADANGS_ENABLED", True),

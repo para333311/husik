@@ -10,7 +10,7 @@ from pathlib import Path
 import husik.telegram.ingest as ingest_module
 from husik.config import Config
 from husik.state.store import StateStore
-from husik.telegram.ingest import PdfRunResult
+from husik.telegram.ingest import IngestStats, PdfRunResult
 
 
 class FakeTelegram:
@@ -151,3 +151,42 @@ def test_legacy_processed_hash_does_not_block_new_upload(tmp_path, monkeypatch):
     assert calls["count"] == 1
     assert not any("이미 처리된 PDF입니다 (중복)." in text for _, text in telegram.sent_messages)
     assert not any(ingest_module.DUPLICATE_MSG == text for _, text in telegram.sent_messages)
+
+
+def test_process_pdf_and_send_sets_gemini_stats_and_openai_calls_default_zero(tmp_path, monkeypatch):
+    config = _make_config(tmp_path)
+    config.gemini_api_key = "gemini-key"
+    config.openai_api_key = "openai-key"
+    config.openai_vision_enabled = False
+    state = StateStore(config.state_dir)
+
+    pdf_path = tmp_path / "sample.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+
+    analysis = ingest_module.PageAnalysis(
+        page_no=1,
+        case_numbers=[],
+        page_case_numbers=[],
+        rating="등급확인",
+        title_candidates=[],
+        raw_text="텍스트 있음",
+        image_path=tmp_path / "page.jpg",
+        source="gemini",
+    )
+
+    monkeypatch.setattr(
+        ingest_module,
+        "analyze_pdf",
+        lambda *_args, **_kwargs: ingest_module.AnalyzedPdf(records=[], analyses=[analysis]),
+    )
+    monkeypatch.setattr(ingest_module, "get_ocr_runtime_stats", lambda: {"openai_vision_calls": 0})
+
+    stats = IngestStats()
+    result = ingest_module.process_pdf_and_send(pdf_path, config, state, config.tmp_dir, stats)
+
+    assert result.detected_cases == 0
+    assert stats.vision_provider == "gemini"
+    assert stats.gemini_pages_analyzed == 1
+    assert stats.gemini_cache_hits == 0
+    assert stats.gemini_cache_misses == 1
+    assert stats.openai_vision_calls == 0

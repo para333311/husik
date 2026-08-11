@@ -142,7 +142,7 @@ def test_title_falls_back_to_case_number_when_no_candidates():
     assert records[0].title == "2024타경1234"
 
 
-def test_analyze_page_calls_openai_fallback_when_case_missing(tmp_path, monkeypatch):
+def test_analyze_page_calls_openai_fallback_when_case_missing_and_explicitly_enabled(tmp_path, monkeypatch):
     rendered = _rendered(tmp_path, 1, text="")
 
     monkeypatch.setattr(detect_module, "extract_page_text", lambda *_: "")
@@ -166,10 +166,37 @@ def test_analyze_page_calls_openai_fallback_when_case_missing(tmp_path, monkeypa
 
     monkeypatch.setattr(detect_module, "openai_vision_case_metadata", _vision)
 
-    analysis = analyze_page(rendered, openai_api_key="dummy")
+    analysis = analyze_page(rendered, openai_api_key="dummy", openai_vision_enabled=True)
 
     assert called["vision"] == 1
     assert analysis.case_numbers == ["2025타경1708"]
+    assert analysis.source == "openai_fallback"
+
+
+def test_analyze_page_does_not_call_openai_when_disabled_even_if_api_key_exists(tmp_path, monkeypatch):
+    rendered = _rendered(tmp_path, 1, text="")
+
+    monkeypatch.setattr(detect_module, "extract_page_text", lambda *_: "")
+    monkeypatch.setattr(detect_module, "_extract_page_case_numbers", lambda *_: ([], []))
+    monkeypatch.setattr(
+        detect_module,
+        "tesseract_ocr_regions",
+        lambda *_args, **_kwargs: {"case": "", "title": "", "sale": ""},
+    )
+
+    called = {"vision": 0}
+
+    def _vision(*_args, **_kwargs):
+        called["vision"] += 1
+        return VisionCaseResult(case_number="2025타경1708")
+
+    monkeypatch.setattr(detect_module, "openai_vision_case_metadata", _vision)
+
+    analysis = analyze_page(rendered, openai_api_key="dummy", openai_vision_enabled=False)
+
+    assert called["vision"] == 0
+    assert analysis.case_numbers == []
+    assert analysis.source == "ocr_fallback"
 
 
 def test_analyze_page_uses_gemini_result_over_ocr(tmp_path, monkeypatch):
@@ -198,10 +225,60 @@ def test_analyze_page_uses_gemini_result_over_ocr(tmp_path, monkeypatch):
         )
     )
 
-    analysis = analyze_page(rendered, vision_provider=provider, work_dir=tmp_path, pdf_hash="pdf")
+    called = {"openai": 0}
+
+    def _openai_meta(*_args, **_kwargs):
+        called["openai"] += 1
+        return VisionCaseResult(case_number="2025타경0001")
+
+    monkeypatch.setattr(detect_module, "openai_vision_case_metadata", _openai_meta)
+
+    analysis = analyze_page(
+        rendered,
+        openai_api_key="dummy",
+        openai_vision_enabled=True,
+        vision_provider=provider,
+        work_dir=tmp_path,
+        pdf_hash="pdf",
+    )
 
     assert analysis.case_numbers == ["2025타경1708"]
     assert analysis.source.startswith("gemini")
+    assert called["openai"] == 0
+
+
+def test_gemini_failure_does_not_fallback_to_openai_even_when_enabled(tmp_path, monkeypatch):
+    rendered = _rendered(tmp_path, 1, text="")
+
+    monkeypatch.setattr(detect_module, "extract_page_text", lambda *_: "")
+    monkeypatch.setattr(detect_module, "_extract_page_case_numbers", lambda *_: ([], []))
+    monkeypatch.setattr(
+        detect_module,
+        "tesseract_ocr_regions",
+        lambda *_args, **_kwargs: {"case": "", "title": "", "sale": ""},
+    )
+
+    provider = StubVisionProvider(None)
+    called = {"openai": 0}
+
+    def _openai_meta(*_args, **_kwargs):
+        called["openai"] += 1
+        return VisionCaseResult(case_number="2025타경1234")
+
+    monkeypatch.setattr(detect_module, "openai_vision_case_metadata", _openai_meta)
+
+    analysis = analyze_page(
+        rendered,
+        openai_api_key="dummy",
+        openai_vision_enabled=True,
+        vision_provider=provider,
+        work_dir=tmp_path,
+        pdf_hash="pdf",
+    )
+
+    assert called["openai"] == 0
+    assert analysis.case_numbers == []
+    assert analysis.source == "ocr_fallback"
 
 
 def test_analyze_page_low_confidence_routes_to_review(tmp_path, monkeypatch):

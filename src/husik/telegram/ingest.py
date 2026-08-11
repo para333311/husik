@@ -26,6 +26,7 @@ from husik.pdf.detect_cases import (
     analyze_page,
     analyze_pdf_pages,
 )
+from husik.pdf.ocr import get_ocr_runtime_stats, reset_ocr_runtime_stats
 from husik.pdf.render import render_pdf_to_images
 from husik.pdf.segment import REVIEW_LABEL, ImageSegment, compose_slides_into_bundles
 from husik.state.store import CaseState, StateStore
@@ -70,6 +71,7 @@ class ChannelSendError(TelegramError):
 @dataclass
 class IngestStats:
     webhook_deleted_or_absent: int = 0
+    vision_provider: str = "ocr"
     updates_seen: int = 0
     messages_seen: int = 0
     channel_posts_seen: int = 0
@@ -92,8 +94,10 @@ class IngestStats:
     no_case_number_pdfs: int = 0
     no_rating_cases: int = 0
     ocr_failed_pdfs: int = 0
-    vision_cache_hits: int = 0
-    vision_cache_misses: int = 0
+    gemini_pages_analyzed: int = 0
+    gemini_cache_hits: int = 0
+    gemini_cache_misses: int = 0
+    openai_vision_calls: int = 0
 
     def log_summary(self) -> None:
         logger.info("===== husik pdf ingest summary =====")
@@ -162,6 +166,7 @@ def analyze_pdf(pdf_path: Path, work_dir: Path, config: Config) -> AnalyzedPdf:
         analyze_page(
             p,
             config.openai_api_key,
+            openai_vision_enabled=config.openai_vision_enabled,
             vision_provider=vision_provider,
             vision_cache=vision_cache,
             pdf_hash=pdf_hash,
@@ -509,13 +514,16 @@ def process_pdf_and_send(
     work_dir = tmp_root / f"work_{hash_file(pdf_path)[:12]}"
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
+        stats.vision_provider = "gemini" if config.gemini_api_key else "ocr"
         analyzed = analyze_pdf(pdf_path, work_dir, config)
         records = analyzed.records
         analyses = analyzed.analyses
 
         stats.pages_rendered += len(analyses)
-        stats.vision_cache_hits += sum(1 for a in analyses if a.source.startswith("gemini(cache)"))
-        stats.vision_cache_misses += sum(1 for a in analyses if a.source == "gemini")
+        stats.gemini_pages_analyzed += sum(1 for a in analyses if a.source.startswith("gemini"))
+        stats.gemini_cache_hits += sum(1 for a in analyses if a.source.startswith("gemini(cache)"))
+        stats.gemini_cache_misses += sum(1 for a in analyses if a.source == "gemini")
+        stats.openai_vision_calls = get_ocr_runtime_stats().get("openai_vision_calls", 0)
 
         result.detected_cases = len(records)
         stats.detected_cases += len(records)
@@ -665,6 +673,7 @@ def process_pdf(
     save_crops_dir: Path | None = None,
 ) -> DryRunReport:
     """CLI process-local-pdf 용. send=True면 실제 반영까지 수행한다."""
+    reset_ocr_runtime_stats()
     work_dir = tmp_root / f"work_{hash_file(pdf_path)[:12]}"
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -713,6 +722,7 @@ def process_pdf(
 
 def poll_and_ingest(config: Config, state: StateStore) -> IngestStats:
     stats = IngestStats()
+    reset_ocr_runtime_stats()
     telegram = TelegramClient(config.telegram_auction_bot_token)
     tmp_root = config.tmp_dir
     tmp_root.mkdir(parents=True, exist_ok=True)

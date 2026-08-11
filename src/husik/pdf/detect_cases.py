@@ -208,17 +208,24 @@ def _analyze_with_gemini(
 def analyze_page(
     rendered: RenderedPage,
     openai_api_key: str | None = None,
+    openai_vision_enabled: bool = False,
     vision_provider: VisionProvider | None = None,
     vision_cache: VisionCache | None = None,
     pdf_hash: str = "",
     work_dir: Path | None = None,
 ) -> PageAnalysis:
     # Vision-first: 사건번호 판정은 Gemini를 우선으로 시도한다.
+    gemini_attempted = bool(vision_provider is not None and vision_provider.enabled and work_dir is not None)
     vision_result = _analyze_with_gemini(rendered, vision_provider, vision_cache, pdf_hash, work_dir)
     vision_blocks = vision_result.case_blocks if vision_result else []
 
     # OCR/PDF text layer는 title/date/status 보조와 fallback에 사용한다.
-    text = extract_page_text(rendered.image_path, rendered.native_text, openai_api_key)
+    text = extract_page_text(
+        rendered.image_path,
+        rendered.native_text,
+        openai_api_key,
+        openai_vision_enabled,
+    )
 
     confirmed_blocks = [
         block for block in vision_blocks if block.confidence >= CASE_CONFIDENT_THRESHOLD and block.case_number
@@ -290,7 +297,7 @@ def analyze_page(
                 review_reason="case number unclear",
             )
 
-    # fallback: PDF text layer + tesseract + OpenAI case metadata
+    # fallback: PDF text layer + tesseract (+ 선택적 OpenAI case metadata)
     top_case_numbers, page_case_numbers = _extract_page_case_numbers(rendered)
 
     region_ocr = tesseract_ocr_regions(
@@ -316,9 +323,19 @@ def analyze_page(
     status = extract_progress_status(text) or extract_progress_status(region_ocr.get("sale", ""))
     sale_date_hint = parse_sale_date_from_text(text) or parse_sale_date_from_text(region_ocr.get("sale", ""))
 
-    if not top_case_numbers and openai_api_key:
+    used_openai_vision = False
+    allow_openai_vision_fallback = bool(
+        openai_api_key and openai_vision_enabled and not gemini_attempted
+    )
+
+    if not top_case_numbers and allow_openai_vision_fallback:
         try:
-            fallback_meta = openai_vision_case_metadata(rendered.image_path, openai_api_key)
+            fallback_meta = openai_vision_case_metadata(
+                rendered.image_path,
+                openai_api_key,
+                enabled=openai_vision_enabled,
+            )
+            used_openai_vision = True
             if fallback_meta.case_number:
                 top_case_numbers = [fallback_meta.case_number]
                 page_case_numbers = [fallback_meta.case_number]
@@ -331,9 +348,16 @@ def analyze_page(
         except Exception:
             pass
 
-    if not top_case_numbers and openai_api_key:
+    if not top_case_numbers and allow_openai_vision_fallback:
         try:
-            top_case_numbers = _unique(openai_vision_case_numbers(rendered.image_path, openai_api_key))
+            top_case_numbers = _unique(
+                openai_vision_case_numbers(
+                    rendered.image_path,
+                    openai_api_key,
+                    enabled=openai_vision_enabled,
+                )
+            )
+            used_openai_vision = True
             if top_case_numbers and not page_case_numbers:
                 page_case_numbers = list(top_case_numbers)
         except Exception:
@@ -354,7 +378,7 @@ def analyze_page(
         uncertain_marker=uncertain,
         status=status,
         sale_date_hint=sale_date_hint,
-        source="ocr_fallback",
+        source="openai_fallback" if used_openai_vision else "ocr_fallback",
         confidence=0.0,
         vision_blocks=[],
         review_reason=review_reason,
