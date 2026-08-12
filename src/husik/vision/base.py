@@ -11,7 +11,7 @@ from typing import Any
 
 @dataclass
 class CaseBlock:
-    case_number: str
+    case_number: str | None
     title: str | None = None
     sale_date: str | None = None
     status: str | None = None
@@ -19,6 +19,7 @@ class CaseBlock:
     y_top: float = 0.0
     y_bottom: float = 1.0
     confidence: float = 0.0
+    boundary_reason: str | None = None
 
 
 @dataclass
@@ -82,8 +83,9 @@ class VisionCache:
         image_hash: str,
         provider_name: str,
         model_name: str,
+        schema_version: str = "",
     ) -> str:
-        return f"{pdf_hash}:{page_no}:{image_hash}:{provider_name}:{model_name}"
+        return f"{pdf_hash}:{page_no}:{image_hash}:{provider_name}:{model_name}:{schema_version}"
 
     def get(self, key: str) -> PageVisionResult | None:
         raw = self._data.get(key)

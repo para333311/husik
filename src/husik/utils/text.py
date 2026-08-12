@@ -40,7 +40,13 @@ TITLE_BLOCKED_TAG_RE = re.compile(
 )
 TITLE_BLOCKED_PHRASES_RE = re.compile(
     r"(?:투기과열지구\s*/\s*조정대상지역|토지거래허가구역\s*/\s*조정대상지역|"
-    r"투기과열지구|조정대상지역|토지거래허가구역|매수맛집|부동산강제경매)"
+    r"투기과열지구|조정대상지역|조정대상구역|토지거래허가구역|매수맛집|부동산강제경매)"
+)
+FORBIDDEN_TELEGRAM_TERMS_RE = re.compile(
+    r"(?:투기과열지구\s*/\s*조정대상지역|투기과열지구|조정대상지역|조정대상구역|"
+    r"토지거래허가구역|부동산강제경매|매수맛집|블로그|관심도|링크|조회수|신규 글|"
+    r"blog_mentions|blog_links)",
+    re.IGNORECASE,
 )
 
 _RATING_COUNTS = {RATING_5: 5, RATING_4: 4, RATING_3: 3, RATING_LOW: 0, RATING_UNKNOWN: 0}
@@ -143,6 +149,14 @@ def _clean_title_line(line: str) -> str:
     cleaned = TITLE_BLOCKED_PHRASES_RE.sub("", cleaned)
     cleaned = cleaned.replace("[]", " ")
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def clean_title(value: str) -> str:
+    text = _clean_title_line(value or "")
+    text = FORBIDDEN_TELEGRAM_TERMS_RE.sub("", text)
+    text = text.replace("[", " ").replace("]", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" -·\t\n")
 
 
 def has_title_grade_marker(text: str) -> bool:

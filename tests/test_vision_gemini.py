@@ -83,6 +83,27 @@ def test_gemini_provider_failure_does_not_crash(tmp_path, monkeypatch):
     assert provider.analyze_page(image, 1, tmp_path) is None
 
 
+def test_vision_cache_key_changes_when_schema_version_changes():
+    key_v1 = VisionCache.build_key(
+        pdf_hash="h",
+        page_no=1,
+        image_hash="img",
+        provider_name="gemini",
+        model_name="gemini-2.5-flash",
+        schema_version="case-boundary-v1",
+    )
+    key_v2 = VisionCache.build_key(
+        pdf_hash="h",
+        page_no=1,
+        image_hash="img",
+        provider_name="gemini",
+        model_name="gemini-2.5-flash",
+        schema_version="case-boundary-v2",
+    )
+
+    assert key_v1 != key_v2
+
+
 def test_vision_cache_prevents_duplicate_provider_call(tmp_path, monkeypatch):
     rendered = _rendered(tmp_path)
     monkeypatch.setattr(detect_module, "extract_page_text", lambda *_: "")

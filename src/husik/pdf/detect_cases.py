@@ -45,6 +45,7 @@ RATING_LOOKAHEAD_PAGES = 3
 MIN_TITLE_LENGTH = 4
 CASE_CONFIDENT_THRESHOLD = 0.75
 CASE_REVIEW_THRESHOLD = 0.55
+VISION_CACHE_SCHEMA_VERSION = "case-boundary-v2"
 _RATING_PRIORITY = {RATING_5: 5, RATING_4: 4, RATING_3: 3, RATING_LOW: 1, RATING_UNKNOWN: 0}
 
 
@@ -163,6 +164,47 @@ def _pick_primary_block(blocks: list[CaseBlock]) -> CaseBlock | None:
     return sorted(blocks, key=lambda b: (-b.confidence, b.y_top))[0]
 
 
+def _sorted_boundary_blocks(blocks: list[CaseBlock]) -> list[CaseBlock]:
+    ordered = sorted(blocks, key=lambda b: b.y_top)
+    result: list[CaseBlock] = []
+    for block in ordered:
+        y_top = max(0.0, min(1.0, block.y_top))
+        if not result or y_top > result[-1].y_top:
+            result.append(block)
+    return result
+
+
+def _retry_null_case_numbers(
+    rendered: RenderedPage,
+    blocks: list[CaseBlock],
+    vision_provider: VisionProvider | None,
+    work_dir: Path | None,
+) -> None:
+    if not isinstance(vision_provider, GeminiVisionProvider) or work_dir is None:
+        return
+
+    ordered = _sorted_boundary_blocks(blocks)
+    for idx, block in enumerate(ordered):
+        if block.case_number is not None:
+            continue
+
+        top_ratio = max(0.0, min(1.0, block.y_top))
+        next_ratio = 1.0
+        if idx + 1 < len(ordered):
+            next_ratio = max(top_ratio, min(1.0, ordered[idx + 1].y_top))
+        top = int(rendered.image_height * top_ratio)
+        bottom = int(rendered.image_height * next_ratio)
+        if bottom <= top:
+            bottom = min(rendered.image_height, top + 20)
+
+        retry_path = work_dir / f"page_{rendered.page_no:03d}_retry_case_{idx + 1:02d}.jpg"
+        crop_band(rendered.image_path, top, bottom, retry_path)
+        retried_case_number = vision_provider.retry_case_number(retry_path, rendered.page_no)
+        if retried_case_number:
+            block.case_number = retried_case_number
+            block.boundary_reason = block.boundary_reason or "gemini_retry"
+
+
 def _analyze_with_gemini(
     rendered: RenderedPage,
     vision_provider: VisionProvider | None,
@@ -186,6 +228,7 @@ def _analyze_with_gemini(
         image_hash=image_hash,
         provider_name=vision_provider.provider_name,
         model_name=vision_provider.model_name,
+        schema_version=VISION_CACHE_SCHEMA_VERSION,
     )
 
     if vision_cache is not None:
@@ -213,13 +256,10 @@ def analyze_page(
     vision_cache: VisionCache | None = None,
     pdf_hash: str = "",
     work_dir: Path | None = None,
+    require_gemini: bool = False,
 ) -> PageAnalysis:
-    # Vision-first: 사건번호 판정은 Gemini를 우선으로 시도한다.
-    gemini_attempted = bool(vision_provider is not None and vision_provider.enabled and work_dir is not None)
-    vision_result = _analyze_with_gemini(rendered, vision_provider, vision_cache, pdf_hash, work_dir)
-    vision_blocks = vision_result.case_blocks if vision_result else []
+    gemini_available = bool(vision_provider is not None and vision_provider.enabled and work_dir is not None)
 
-    # OCR/PDF text layer는 title/date/status 보조와 fallback에 사용한다.
     text = extract_page_text(
         rendered.image_path,
         rendered.native_text,
@@ -227,18 +267,57 @@ def analyze_page(
         openai_vision_enabled,
     )
 
+    if require_gemini and vision_provider is not None and not gemini_available:
+        return PageAnalysis(
+            page_no=rendered.page_no,
+            case_numbers=[],
+            page_case_numbers=[],
+            rating=classify_rating(text),
+            title_candidates=extract_title_candidates(text),
+            raw_text=text,
+            image_path=rendered.image_path,
+            uncertain_marker=True,
+            status=extract_progress_status(text),
+            sale_date_hint=parse_sale_date_from_text(text),
+            source="gemini_unavailable",
+            confidence=0.0,
+            vision_blocks=[],
+            review_reason="gemini unavailable",
+        )
+
+    vision_result = _analyze_with_gemini(rendered, vision_provider, vision_cache, pdf_hash, work_dir)
+    if require_gemini and vision_provider is not None and gemini_available and vision_result is None:
+        return PageAnalysis(
+            page_no=rendered.page_no,
+            case_numbers=[],
+            page_case_numbers=[],
+            rating=classify_rating(text),
+            title_candidates=extract_title_candidates(text),
+            raw_text=text,
+            image_path=rendered.image_path,
+            uncertain_marker=True,
+            status=extract_progress_status(text),
+            sale_date_hint=parse_sale_date_from_text(text),
+            source="gemini_failed",
+            confidence=0.0,
+            vision_blocks=[],
+            review_reason="gemini analysis failed",
+        )
+
+    vision_blocks = vision_result.case_blocks if vision_result else []
+    _retry_null_case_numbers(rendered, vision_blocks, vision_provider, work_dir)
+
     confirmed_blocks = [
         block for block in vision_blocks if block.confidence >= CASE_CONFIDENT_THRESHOLD and block.case_number
     ]
 
     if confirmed_blocks:
-        page_case_numbers = _unique(
-            [block.case_number for block in sorted(confirmed_blocks, key=lambda b: b.y_top)]
-        )
+        ordered_blocks = sorted(confirmed_blocks, key=lambda b: b.y_top)
+        page_case_numbers = _unique([block.case_number for block in ordered_blocks if block.case_number])
         top_case_numbers = list(page_case_numbers)
         primary = _pick_primary_block(confirmed_blocks)
 
-        title_candidates = [block.title for block in confirmed_blocks if block.title]
+        title_candidates = [block.title for block in ordered_blocks if block.title]
         title_candidates.extend(extract_title_candidates(text))
         sale_date_hint = None
         if primary and primary.sale_date:
@@ -252,6 +331,13 @@ def analyze_page(
 
         status = (primary.status if primary else None) or extract_progress_status(text)
         confidence = max(block.confidence for block in confirmed_blocks)
+        unknown_boundaries = [
+            block
+            for block in vision_blocks
+            if block.case_number is None
+            and block.confidence >= CASE_REVIEW_THRESHOLD
+            and (has_title_grade_marker(block.title or "") or block.boundary_reason == "title_rating")
+        ]
 
         return PageAnalysis(
             page_no=rendered.page_no,
@@ -261,23 +347,29 @@ def analyze_page(
             title_candidates=_unique([x for x in title_candidates if x]),
             raw_text=text,
             image_path=rendered.image_path,
-            uncertain_marker=False,
+            uncertain_marker=bool(unknown_boundaries),
             status=status,
             sale_date_hint=sale_date_hint,
             source=vision_result.source if vision_result else "gemini",
             confidence=confidence,
             vision_blocks=vision_blocks,
             review_reason=(
-                "case number unclear" if vision_result and vision_result.review_required else None
+                "case boundary review required"
+                if (vision_result and vision_result.review_required) or unknown_boundaries
+                else None
             ),
         )
 
-    # Gemini가 켜져 있고 사건 후보를 봤지만 신뢰도가 낮으면 fallback으로 억지 연결하지 않는다.
     if vision_result is not None:
         review_blocks = [
             block
             for block in vision_blocks
-            if block.case_number and block.confidence >= CASE_REVIEW_THRESHOLD
+            if block.confidence >= CASE_REVIEW_THRESHOLD
+            and (
+                block.case_number
+                or has_title_grade_marker(block.title or "")
+                or block.boundary_reason == "title_rating"
+            )
         ]
         if vision_result.review_required or review_blocks:
             return PageAnalysis(
@@ -297,7 +389,6 @@ def analyze_page(
                 review_reason="case number unclear",
             )
 
-    # fallback: PDF text layer + tesseract (+ 선택적 OpenAI case metadata)
     top_case_numbers, page_case_numbers = _extract_page_case_numbers(rendered)
 
     region_ocr = tesseract_ocr_regions(
@@ -324,9 +415,7 @@ def analyze_page(
     sale_date_hint = parse_sale_date_from_text(text) or parse_sale_date_from_text(region_ocr.get("sale", ""))
 
     used_openai_vision = False
-    allow_openai_vision_fallback = bool(
-        openai_api_key and openai_vision_enabled and not gemini_attempted
-    )
+    allow_openai_vision_fallback = bool(openai_api_key and openai_vision_enabled and vision_provider is None)
 
     if not top_case_numbers and allow_openai_vision_fallback:
         try:
@@ -498,30 +587,54 @@ def _segment_page_with_vision_blocks(
     analysis: PageAnalysis,
     work_dir: Path,
 ) -> list[ImageSegment]:
-    confident_blocks = [
+    boundary_blocks = [
         block
-        for block in analysis.vision_blocks
-        if block.case_number and block.confidence >= CASE_CONFIDENT_THRESHOLD
+        for block in _sorted_boundary_blocks(analysis.vision_blocks)
+        if block.confidence >= CASE_REVIEW_THRESHOLD
+        and (
+            block.case_number
+            or has_title_grade_marker(block.title or "")
+            or block.boundary_reason == "title_rating"
+        )
     ]
-    if len(confident_blocks) <= 1:
+    if len(boundary_blocks) <= 1:
         return []
 
     segments: list[ImageSegment] = []
-    for i, block in enumerate(sorted(confident_blocks, key=lambda b: b.y_top), start=1):
-        y_top = int(rendered.image_height * max(0.0, min(1.0, block.y_top)))
-        y_bottom = int(rendered.image_height * max(0.0, min(1.0, block.y_bottom)))
+    for i, block in enumerate(boundary_blocks, start=1):
+        current_top = max(0.0, min(1.0, block.y_top))
+        next_top = 1.0
+        if i < len(boundary_blocks):
+            next_top = max(current_top, min(1.0, boundary_blocks[i].y_top))
+
+        y_top = int(rendered.image_height * current_top)
+        y_bottom = int(rendered.image_height * next_top)
         if y_bottom <= y_top:
             y_bottom = min(rendered.image_height, y_top + 20)
+
         crop_path = work_dir / f"page_{rendered.page_no:03d}_vision_crop{i:02d}.jpg"
         crop_band(rendered.image_path, y_top, y_bottom, crop_path)
+
+        if block.case_number:
+            case_number = block.case_number
+            is_review = False
+        else:
+            case_number = REVIEW_LABEL
+            is_review = True
+
+        refs = [f"p{rendered.page_no} crop{i}"]
+        if block.title:
+            refs.append(block.title)
+
         segments.append(
             ImageSegment(
-                case_number=block.case_number,
+                case_number=case_number,
                 page_no=rendered.page_no,
                 image_path=crop_path,
+                is_review=is_review,
                 from_mixed_page=True,
                 order_index=i,
-                source_refs=[f"p{rendered.page_no} crop{i}"],
+                source_refs=refs,
             )
         )
     return segments
@@ -538,14 +651,15 @@ def assign_image_segments(
     page_segments: dict[int, list[ImageSegment]] = {}
     review_segments: list[ImageSegment] = []
     for analysis in analyses:
-        if len(analysis.page_case_numbers) <= 1:
-            continue
-
         rendered = rendered_by_page.get(analysis.page_no)
         if rendered is None:
             continue
 
         vision_segments = _segment_page_with_vision_blocks(rendered, analysis, work_dir)
+        has_boundary_splits = len(analysis.vision_blocks) > 1
+        if len(analysis.page_case_numbers) <= 1 and not has_boundary_splits and not vision_segments:
+            continue
+
         segments = vision_segments or segment_page(rendered, analysis.page_case_numbers, work_dir)
         page_segments[analysis.page_no] = segments
         review_segments.extend([seg for seg in segments if seg.is_review or seg.case_number == REVIEW_LABEL])

@@ -39,7 +39,7 @@ from husik.telegram.templates import (
     InterestStats,
     build_representative_message,
 )
-from husik.utils.text import RATING_UNKNOWN, normalize_sale_date
+from husik.utils.text import RATING_UNKNOWN, clean_title, normalize_sale_date
 from husik.vision.base import VisionCache
 from husik.vision.gemini import GeminiVisionProvider
 
@@ -72,6 +72,7 @@ class ChannelSendError(TelegramError):
 class IngestStats:
     webhook_deleted_or_absent: int = 0
     vision_provider: str = "ocr"
+    gemini_available: str = "false"
     updates_seen: int = 0
     messages_seen: int = 0
     channel_posts_seen: int = 0
@@ -95,6 +96,7 @@ class IngestStats:
     no_rating_cases: int = 0
     ocr_failed_pdfs: int = 0
     gemini_pages_analyzed: int = 0
+    gemini_case_blocks: int = 0
     gemini_cache_hits: int = 0
     gemini_cache_misses: int = 0
     openai_vision_calls: int = 0
@@ -102,7 +104,10 @@ class IngestStats:
     def log_summary(self) -> None:
         logger.info("===== husik pdf ingest summary =====")
         for f in fields(self):
-            logger.info("PDF_INGEST_STAT %s=%s", f.name, getattr(self, f.name))
+            value = getattr(self, f.name)
+            if isinstance(value, bool):
+                value = str(value).lower()
+            logger.info("PDF_INGEST_STAT %s=%s", f.name, value)
         logger.info("=====================================")
 
 
@@ -157,7 +162,12 @@ def hash_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def analyze_pdf(pdf_path: Path, work_dir: Path, config: Config) -> AnalyzedPdf:
+def analyze_pdf(
+    pdf_path: Path,
+    work_dir: Path,
+    config: Config,
+    require_gemini: bool = False,
+) -> AnalyzedPdf:
     rendered_pages = render_pdf_to_images(pdf_path, work_dir)
     vision_provider = GeminiVisionProvider(config.gemini_api_key, config.gemini_model)
     vision_cache = VisionCache(config.state_dir)
@@ -171,6 +181,7 @@ def analyze_pdf(pdf_path: Path, work_dir: Path, config: Config) -> AnalyzedPdf:
             vision_cache=vision_cache,
             pdf_hash=pdf_hash,
             work_dir=work_dir,
+            require_gemini=require_gemini,
         )
         for p in rendered_pages
     ]
@@ -293,28 +304,11 @@ def _send_image_chunk(
     captions: list[str],
     reply_to_message_id: int,
 ) -> tuple[list[int], int]:
-    if len(chunk) == 1:
-        msg_id = send_photo_with_fallback(telegram, channel_id, chunk[0], captions[0], reply_to_message_id)
-        return ([msg_id], 0) if msg_id is not None else ([], 1)
-
-    try:
-        result = telegram.send_media_group(
-            channel_id, chunk, captions, reply_to_message_id=reply_to_message_id
-        )
-        return [item["message_id"] for item in result if "message_id" in item], 0
-    except TelegramError as exc:
-        logger.warning("media group with reply failed, retrying without reply: %s", exc)
-
-    try:
-        result = telegram.send_media_group(channel_id, chunk, captions)
-        return [item["message_id"] for item in result if "message_id" in item], 0
-    except TelegramError as exc:
-        logger.warning("media group failed entirely, falling back to per-photo sendPhoto: %s", exc)
-
     ids: list[int] = []
     failed = 0
-    for path, caption in zip(chunk, captions, strict=False):
-        msg_id = send_photo_with_fallback(telegram, channel_id, path, caption, None)
+    for idx, (path, caption) in enumerate(zip(chunk, captions, strict=False)):
+        reply_id = reply_to_message_id if idx == 0 else None
+        msg_id = send_photo_with_fallback(telegram, channel_id, path, caption, reply_id)
         if msg_id is None:
             failed += 1
         else:
@@ -347,20 +341,12 @@ def send_case_to_telegram(
     image_ids: list[int] = []
     images_failed = 0
     segments = record.image_segments
-    continuation_index = 1
+
     for start in range(0, len(segments), MAX_ALBUM_SIZE):
         chunk_segments = segments[start : start + MAX_ALBUM_SIZE]
         chunk_paths = [seg.image_path for seg in chunk_segments]
         captions = ["" for _ in chunk_segments]
-
-        reply_id = rep_id
-        if start > 0:
-            header_text = _continue_header(record.case_number, continuation_index)
-            followup = telegram.send_message(channel_id, header_text)
-            reply_id = followup["message_id"]
-            continuation_index += 1
-
-        sent_ids, failed = _send_image_chunk(telegram, channel_id, chunk_paths, captions, reply_id)
+        sent_ids, failed = _send_image_chunk(telegram, channel_id, chunk_paths, captions, rep_id)
         image_ids.extend(sent_ids)
         images_failed += failed
     return _CaseTelegramResult(
@@ -409,7 +395,7 @@ def _process_single_case(
 
     known_urls = set(existing.blog_urls) if existing else set()
     new_posts = []
-    if config.blog_monitor_enabled:
+    if config.enable_blog_augmentation and config.blog_monitor_enabled:
         new_posts = find_new_posts(
             config.naver_client_id,
             config.naver_client_secret,
@@ -428,6 +414,9 @@ def _process_single_case(
         recent_blog_mentions=recent_count,
     )
     message_data = _to_message_data(record, auction_info, interest)
+    message_data.title = clean_title(message_data.title)
+    if not message_data.title:
+        message_data.title = record.case_number
     text = build_representative_message(message_data)
 
     # ChannelSendError는 여기서 잡지 않고 호출자(process_pdf_and_send)로 전파한다.
@@ -447,7 +436,7 @@ def _process_single_case(
         representative_message_id=send_result.representative_message_id,
         image_message_ids=send_result.image_message_ids,
         rating=record.rating,
-        title=record.title,
+        title=message_data.title,
         status=auction_info.status or "확인중",
         blog_urls=blog_urls,
         auction_info={
@@ -473,7 +462,7 @@ def _process_single_case(
             try:
                 notion_data = NotionCaseData(
                     case_number=record.case_number,
-                    title=record.title,
+                    title=message_data.title,
                     rating=record.rating or RATING_UNKNOWN,
                     item_number="확인중",
                     court=auction_info.court or "확인중",
@@ -514,13 +503,15 @@ def process_pdf_and_send(
     work_dir = tmp_root / f"work_{hash_file(pdf_path)[:12]}"
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        stats.vision_provider = "gemini" if config.gemini_api_key else "ocr"
-        analyzed = analyze_pdf(pdf_path, work_dir, config)
+        stats.vision_provider = "gemini"
+        stats.gemini_available = "true" if bool(config.gemini_api_key.strip()) else "false"
+        analyzed = analyze_pdf(pdf_path, work_dir, config, require_gemini=True)
         records = analyzed.records
         analyses = analyzed.analyses
 
         stats.pages_rendered += len(analyses)
         stats.gemini_pages_analyzed += sum(1 for a in analyses if a.source.startswith("gemini"))
+        stats.gemini_case_blocks += sum(len(a.vision_blocks) for a in analyses)
         stats.gemini_cache_hits += sum(1 for a in analyses if a.source.startswith("gemini(cache)"))
         stats.gemini_cache_misses += sum(1 for a in analyses if a.source == "gemini")
         stats.openai_vision_calls = get_ocr_runtime_stats().get("openai_vision_calls", 0)
@@ -536,6 +527,19 @@ def process_pdf_and_send(
                 result.ocr_failed = True
             else:
                 stats.no_case_number_pdfs += 1
+
+            if analyzed.review_segments:
+                try:
+                    telegram = TelegramClient(config.telegram_auction_bot_token)
+                    _send_review_segments(
+                        telegram,
+                        config.telegram_auction_channel_id,
+                        analyzed.review_segments,
+                        work_dir,
+                    )
+                except Exception:
+                    logger.exception("failed to send review segments")
+                    stats.errors_count += 1
             return result
 
         for r in records:
@@ -606,10 +610,19 @@ def _send_review_segments(
     """
     pages = sorted({seg.page_no for seg in segments})
     page_list = ", ".join(f"page {p}" for p in pages)
-    header = "[검토필요]\n사건번호 인식 불확실"
+    review_titles = [
+        seg.source_refs[1]
+        for seg in segments
+        if len(seg.source_refs) > 1 and seg.source_refs[1].strip()
+    ]
+    header = "[검토필요]"
+    if review_titles:
+        header += "\n" + clean_title(review_titles[0])
+    else:
+        header += "\n사건번호 인식 불확실"
     if page_list:
         header += f"\n· {page_list}"
-    sent = telegram.send_message(channel_id, header, parse_mode="HTML")
+    sent = telegram.send_message(channel_id, header)
     rep_id = sent["message_id"]
 
     ordered = sorted(segments, key=lambda s: (s.page_no, s.order_index))

@@ -251,12 +251,6 @@ def test_gemini_failure_does_not_fallback_to_openai_even_when_enabled(tmp_path, 
     rendered = _rendered(tmp_path, 1, text="")
 
     monkeypatch.setattr(detect_module, "extract_page_text", lambda *_: "")
-    monkeypatch.setattr(detect_module, "_extract_page_case_numbers", lambda *_: ([], []))
-    monkeypatch.setattr(
-        detect_module,
-        "tesseract_ocr_regions",
-        lambda *_args, **_kwargs: {"case": "", "title": "", "sale": ""},
-    )
 
     provider = StubVisionProvider(None)
     called = {"openai": 0}
@@ -274,11 +268,13 @@ def test_gemini_failure_does_not_fallback_to_openai_even_when_enabled(tmp_path, 
         vision_provider=provider,
         work_dir=tmp_path,
         pdf_hash="pdf",
+        require_gemini=True,
     )
 
     assert called["openai"] == 0
     assert analysis.case_numbers == []
-    assert analysis.source == "ocr_fallback"
+    assert analysis.source == "gemini_failed"
+    assert analysis.review_reason == "gemini analysis failed"
 
 
 def test_analyze_page_low_confidence_routes_to_review(tmp_path, monkeypatch):
@@ -320,3 +316,79 @@ def test_analyze_page_works_without_openai_key(tmp_path, monkeypatch):
     analysis = analyze_page(rendered, openai_api_key=None)
 
     assert analysis.case_numbers == ["2025타경1708"]
+
+
+class DisabledVisionProvider(StubVisionProvider):
+    @property
+    def enabled(self) -> bool:
+        return False
+
+
+def test_gemini_unavailable_routes_page_to_review(tmp_path, monkeypatch):
+    rendered = _rendered(tmp_path, 1, text="")
+    monkeypatch.setattr(detect_module, "extract_page_text", lambda *_: "")
+
+    analysis = analyze_page(
+        rendered,
+        vision_provider=DisabledVisionProvider(None),
+        work_dir=tmp_path,
+        pdf_hash="pdf",
+        require_gemini=True,
+    )
+
+    assert analysis.source == "gemini_unavailable"
+    assert analysis.review_reason == "gemini unavailable"
+    assert analysis.case_numbers == []
+
+
+def test_segment_page_with_vision_blocks_uses_next_y_top_boundaries(tmp_path, monkeypatch):
+    rendered = _rendered(tmp_path, 3, text="")
+    rendered = RenderedPage(
+        page_no=rendered.page_no,
+        image_path=rendered.image_path,
+        native_text=rendered.native_text,
+        image_width=rendered.image_width,
+        image_height=1000,
+    )
+
+    analysis = PageAnalysis(
+        page_no=3,
+        case_numbers=["2025타경12975"],
+        page_case_numbers=["2025타경12975"],
+        rating=RATING_UNKNOWN,
+        title_candidates=["기존 사건"],
+        raw_text="",
+        image_path=rendered.image_path,
+        source="gemini",
+        vision_blocks=[
+            CaseBlock(case_number="2025타경12975", y_top=0.0, y_bottom=0.9, confidence=0.92),
+            CaseBlock(
+                case_number=None,
+                title="상도24 $$",
+                y_top=0.32,
+                y_bottom=1.0,
+                confidence=0.9,
+                boundary_reason="title_rating",
+            ),
+        ],
+    )
+
+    calls = []
+
+    def _fake_crop(_image_path, y_top, y_bottom, out_path):
+        calls.append((y_top, y_bottom, out_path.name))
+        out_path.write_bytes(b"crop")
+        return out_path
+
+    monkeypatch.setattr(detect_module, "crop_band", _fake_crop)
+
+    segments = detect_module._segment_page_with_vision_blocks(rendered, analysis, tmp_path)
+
+    assert len(segments) == 2
+    assert calls[0][0] == 0
+    assert calls[0][1] == 320
+    assert calls[1][0] == 320
+    assert calls[1][1] == 1000
+    assert segments[0].case_number == "2025타경12975"
+    assert segments[1].is_review is True
+    assert segments[1].case_number == "검토필요"

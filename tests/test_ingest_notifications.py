@@ -6,6 +6,8 @@ from husik.telegram.ingest import (
     PdfRunResult,
     build_result_notifications,
 )
+from husik.telegram.templates import CaseMessageData, build_representative_message
+from husik.utils.text import clean_title
 
 
 def test_zero_detected_cases_produces_no_case_message():
@@ -46,3 +48,23 @@ def test_partial_image_failure_appends_extra_note():
 def test_always_returns_at_least_one_notification():
     # 완전 무반응 상태를 방지: 어떤 조합이든 최소 1개는 반환해야 한다.
     assert len(build_result_notifications(PdfRunResult())) >= 1
+
+
+def test_clean_title_removes_forbidden_terms_for_pdf_ingest_output():
+    raw = "[2025타경12975] [투기과열지구/조정대상지역] 매수맛집 부동산강제경매 상도24 $$"
+    assert clean_title(raw) == "2025타경12975 상도24 $$"
+
+
+def test_representative_message_does_not_include_blog_or_link_lines():
+    title = clean_title("상도24 $$ 투기과열지구 링크 블로그")
+    message = build_representative_message(
+        CaseMessageData(
+            case_number="2025타경12975",
+            rating="$$$",
+            title=title,
+            sale_date_text="2026.6.9",
+            status_text="낙찰",
+        )
+    )
+
+    assert message == "[2025타경12975]\n상도24 $$\n· 매각기일 2026.6.9\n· 낙찰"

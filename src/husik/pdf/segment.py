@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 REVIEW_LABEL = "검토필요"
 LEFT_MARKER_X_RATIO = 0.45
 MAX_MARKER_LINE_LENGTH = 40
-BUNDLE_SIZE = 4
+SLIDES_PER_COMPOSITE = 4
+BUNDLE_SIZE = SLIDES_PER_COMPOSITE
 BUNDLE_WIDTH = 1800
 BUNDLE_GAP = 12
 
@@ -182,8 +183,11 @@ def compose_slides_into_bundles(
             seg.source_refs = [_segment_ref(seg)]
 
     bundles: list[ImageSegment] = []
-    for index, start in enumerate(range(0, len(sorted_slides), bundle_size), start=1):
-        chunk = sorted_slides[start : start + bundle_size]
+    fixed_bundle_size = SLIDES_PER_COMPOSITE
+    for index, start in enumerate(range(0, len(sorted_slides), fixed_bundle_size), start=1):
+        chunk = sorted_slides[start : start + fixed_bundle_size]
+        if len(chunk) > SLIDES_PER_COMPOSITE:
+            raise ValueError("composite cannot contain more than 4 slides")
 
         resized_images: list[Image.Image] = []
         refs: list[str] = []

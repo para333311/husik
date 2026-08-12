@@ -129,6 +129,12 @@ def test_compose_bundle_counts_follow_4_slide_rule(tmp_path):
     five = [_slide(tmp_path, i, i, 1) for i in range(1, 6)]
     assert len(compose_slides_into_bundles("2025타경1708", five, tmp_path)) == 2
 
+    six = [_slide(tmp_path, i, i, 1) for i in range(1, 7)]
+    six_bundles = compose_slides_into_bundles("2025타경1708", six, tmp_path)
+    assert len(six_bundles) == 2
+    assert six_bundles[0].slide_indices == [1, 2, 3, 4]
+    assert six_bundles[1].slide_indices == [5, 6]
+
     nine = [_slide(tmp_path, i, i, 1) for i in range(1, 10)]
     assert len(compose_slides_into_bundles("2025타경1708", nine, tmp_path)) == 3
 

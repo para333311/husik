@@ -11,6 +11,7 @@ import husik.telegram.ingest as ingest_module
 from husik.config import Config
 from husik.state.store import StateStore
 from husik.telegram.ingest import IngestStats, PdfRunResult
+from husik.vision.base import CaseBlock
 
 
 class FakeTelegram:
@@ -172,6 +173,7 @@ def test_process_pdf_and_send_sets_gemini_stats_and_openai_calls_default_zero(tm
         raw_text="텍스트 있음",
         image_path=tmp_path / "page.jpg",
         source="gemini",
+        vision_blocks=[CaseBlock(case_number="2025타경1111", confidence=0.9)],
     )
 
     monkeypatch.setattr(
@@ -186,7 +188,9 @@ def test_process_pdf_and_send_sets_gemini_stats_and_openai_calls_default_zero(tm
 
     assert result.detected_cases == 0
     assert stats.vision_provider == "gemini"
+    assert stats.gemini_available == "true"
     assert stats.gemini_pages_analyzed == 1
+    assert stats.gemini_case_blocks == 1
     assert stats.gemini_cache_hits == 0
     assert stats.gemini_cache_misses == 1
     assert stats.openai_vision_calls == 0
