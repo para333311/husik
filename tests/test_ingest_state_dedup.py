@@ -2,7 +2,7 @@
 
 정책:
 - 같은 PDF hash라도 새 Telegram 메시지(message_id)면 재처리한다.
-- 중복 차단은 같은 update_id 또는 같은 (chat_id, message_id)에만 적용한다.
+- 중복 차단은 같은 (chat_id, message_id)에만 적용한다.
 - legacy processed_pdf_hashes 값은 재처리 차단 gate가 아니다.
 """
 from pathlib import Path
@@ -11,7 +11,6 @@ import husik.telegram.ingest as ingest_module
 from husik.config import Config
 from husik.state.store import StateStore
 from husik.telegram.ingest import IngestStats, PdfRunResult
-from husik.vision.base import CaseBlock
 
 
 class FakeTelegram:
@@ -112,7 +111,7 @@ def test_same_pdf_hash_with_same_message_id_is_skipped(tmp_path, monkeypatch):
     assert any(ingest_module.DUPLICATE_MSG == text for _, text in telegram.sent_messages)
 
 
-def test_same_update_id_is_skipped_even_when_replayed(tmp_path, monkeypatch):
+def test_same_update_id_with_different_message_id_is_reprocessed(tmp_path, monkeypatch):
     config = _make_config(tmp_path)
     state = StateStore(config.state_dir)
     telegram = FakeTelegram()
@@ -128,8 +127,8 @@ def test_same_update_id_is_skipped_even_when_replayed(tmp_path, monkeypatch):
     _handle(_make_update(update_id=33, message_id=901), config, state, telegram)
     _handle(_make_update(update_id=33, message_id=902), config, state, telegram)
 
-    assert calls["count"] == 1
-    assert any(ingest_module.DUPLICATE_MSG == text for _, text in telegram.sent_messages)
+    assert calls["count"] == 2
+    assert not any(ingest_module.DUPLICATE_MSG == text for _, text in telegram.sent_messages)
 
 
 def test_legacy_processed_hash_does_not_block_new_upload(tmp_path, monkeypatch):
@@ -154,43 +153,96 @@ def test_legacy_processed_hash_does_not_block_new_upload(tmp_path, monkeypatch):
     assert not any(ingest_module.DUPLICATE_MSG == text for _, text in telegram.sent_messages)
 
 
-def test_process_pdf_and_send_sets_gemini_stats_and_openai_calls_default_zero(tmp_path, monkeypatch):
+class FakeTelegramPhotoClient:
+    def __init__(self):
+        self.send_photo_calls: list[Path] = []
+        self.send_media_group_calls: int = 0
+
+    def send_photo(self, chat_id, photo_path, caption="", reply_to_message_id=None):
+        assert caption == ""
+        assert reply_to_message_id is None
+        self.send_photo_calls.append(photo_path)
+        return {"message_id": len(self.send_photo_calls)}
+
+    def send_media_group(self, *args, **kwargs):
+        self.send_media_group_calls += 1
+        raise AssertionError("media group must not be called")
+
+
+def _build_pdf(path: Path, page_count: int) -> None:
+    fitz = __import__("fitz")
+    doc = fitz.open()
+    for i in range(page_count):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((50, 120), f"PAGE {i + 1}", fontsize=24)
+    doc.save(str(path))
+    doc.close()
+
+
+def test_process_pdf_and_send_simple_bundle_mode_disables_ai_and_external_calls(tmp_path, monkeypatch):
     config = _make_config(tmp_path)
-    config.gemini_api_key = "gemini-key"
-    config.openai_api_key = "openai-key"
-    config.openai_vision_enabled = False
     state = StateStore(config.state_dir)
+    pdf_path = tmp_path / "sample9.pdf"
+    _build_pdf(pdf_path, 9)
 
-    pdf_path = tmp_path / "sample.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4\n")
+    fake_telegram = FakeTelegramPhotoClient()
 
-    analysis = ingest_module.PageAnalysis(
-        page_no=1,
-        case_numbers=[],
-        page_case_numbers=[],
-        rating="등급확인",
-        title_candidates=[],
-        raw_text="텍스트 있음",
-        image_path=tmp_path / "page.jpg",
-        source="gemini",
-        vision_blocks=[CaseBlock(case_number="2025타경1111", confidence=0.9)],
-    )
-
+    monkeypatch.setattr(ingest_module, "TelegramClient", lambda *_args, **_kwargs: fake_telegram)
     monkeypatch.setattr(
         ingest_module,
         "analyze_pdf",
-        lambda *_args, **_kwargs: ingest_module.AnalyzedPdf(records=[], analyses=[analysis]),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("analyze_pdf must not be called")),
     )
-    monkeypatch.setattr(ingest_module, "get_ocr_runtime_stats", lambda: {"openai_vision_calls": 0})
+    monkeypatch.setattr(
+        ingest_module,
+        "enrich_case",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("enrich_case must not be called")),
+    )
+    monkeypatch.setattr(
+        ingest_module,
+        "find_new_posts",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("find_new_posts must not be called")),
+    )
+    monkeypatch.setattr(
+        ingest_module,
+        "NotionClient",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("NotionClient must not be called")),
+    )
 
     stats = IngestStats()
     result = ingest_module.process_pdf_and_send(pdf_path, config, state, config.tmp_dir, stats)
 
-    assert result.detected_cases == 0
-    assert stats.vision_provider == "gemini"
-    assert stats.gemini_available == "true"
-    assert stats.gemini_pages_analyzed == 1
-    assert stats.gemini_case_blocks == 1
-    assert stats.gemini_cache_hits == 0
-    assert stats.gemini_cache_misses == 1
+    assert result.images_sent == 3
+    assert result.images_failed == 0
+    sent_names = [p.name for p in fake_telegram.send_photo_calls]
+    assert sent_names == ["image_001_004.jpg", "image_005_008.jpg", "image_009_009.jpg"]
+    assert fake_telegram.send_media_group_calls == 0
+
+    assert stats.gemini_pages_analyzed == 0
     assert stats.openai_vision_calls == 0
+    assert stats.tesseract_calls == 0
+    assert stats.notion_upserted == 0
+    assert stats.blog_calls == 0
+
+
+def test_simple_bundle_never_sends_more_than_four_source_pages_per_image(tmp_path, monkeypatch):
+    config = _make_config(tmp_path)
+    state = StateStore(config.state_dir)
+    pdf_path = tmp_path / "sample21.pdf"
+    _build_pdf(pdf_path, 21)
+
+    fake_telegram = FakeTelegramPhotoClient()
+    monkeypatch.setattr(ingest_module, "TelegramClient", lambda *_args, **_kwargs: fake_telegram)
+
+    stats = IngestStats()
+    ingest_module.process_pdf_and_send(pdf_path, config, state, config.tmp_dir, stats)
+
+    sent_names = [p.name for p in fake_telegram.send_photo_calls]
+    assert sent_names == [
+        "image_001_004.jpg",
+        "image_005_008.jpg",
+        "image_009_012.jpg",
+        "image_013_016.jpg",
+        "image_017_020.jpg",
+        "image_021_021.jpg",
+    ]

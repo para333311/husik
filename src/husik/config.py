@@ -52,6 +52,7 @@ class Config:
     madangs_enabled: bool
     blog_monitor_enabled: bool
     enable_blog_augmentation: bool = False
+    simple_pdf_bundle_only: bool = True
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
     openai_vision_enabled: bool = False
@@ -79,6 +80,7 @@ class Config:
             madangs_enabled=_bool_env("MADANGS_ENABLED", True),
             blog_monitor_enabled=_bool_env("BLOG_MONITOR_ENABLED", True),
             enable_blog_augmentation=_bool_env("ENABLE_BLOG_AUGMENTATION", False),
+            simple_pdf_bundle_only=_bool_env("SIMPLE_PDF_BUNDLE_ONLY", True),
             state_dir=Path(os.environ.get("HUSIK_STATE_DIR", "data/state")),
             tmp_dir=Path(os.environ.get("HUSIK_TMP_DIR", "data/tmp")),
         )

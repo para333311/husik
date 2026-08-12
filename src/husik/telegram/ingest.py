@@ -29,6 +29,11 @@ from husik.pdf.detect_cases import (
 from husik.pdf.ocr import get_ocr_runtime_stats, reset_ocr_runtime_stats
 from husik.pdf.render import render_pdf_to_images
 from husik.pdf.segment import REVIEW_LABEL, ImageSegment, compose_slides_into_bundles
+from husik.pdf.simple_bundle import (
+    PAGES_PER_COMPOSITE,
+    compose_pages_by_four,
+    render_pdf_pages,
+)
 from husik.state.store import CaseState, StateStore
 from husik.telegram.client import TelegramClient, TelegramError
 from husik.telegram.commands import handle_bot_command
@@ -100,6 +105,8 @@ class IngestStats:
     gemini_cache_hits: int = 0
     gemini_cache_misses: int = 0
     openai_vision_calls: int = 0
+    tesseract_calls: int = 0
+    blog_calls: int = 0
 
     def log_summary(self) -> None:
         logger.info("===== husik pdf ingest summary =====")
@@ -495,10 +502,60 @@ def _process_single_case(
     return outcome
 
 
+def _send_pdf_as_simple_bundles(
+    pdf_path: Path,
+    config: Config,
+    tmp_root: Path,
+    stats: IngestStats,
+) -> PdfRunResult:
+    result = PdfRunResult()
+    work_dir = tmp_root / f"simple_{hash_file(pdf_path)[:12]}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        rendered_pages = render_pdf_pages(pdf_path, work_dir)
+        bundles = compose_pages_by_four(rendered_pages, work_dir / "bundles")
+        stats.pages_rendered += len(rendered_pages)
+        stats.vision_provider = "disabled"
+        stats.gemini_available = "false"
+
+        telegram = TelegramClient(config.telegram_auction_bot_token)
+        for bundle in bundles:
+            if len(bundle.source_page_numbers) > PAGES_PER_COMPOSITE:
+                raise ValueError("composite source pages must be <= 4")
+
+            sent_id = send_photo_with_fallback(
+                telegram,
+                config.telegram_auction_channel_id,
+                bundle.image_path,
+                caption="",
+                reply_to_message_id=None,
+            )
+            if sent_id is None:
+                logger.error(
+                    "failed to send composite %s (%s-%s)",
+                    bundle.image_path.name,
+                    bundle.start_page,
+                    bundle.end_page,
+                )
+                result.images_failed += 1
+                stats.errors_count += 1
+                continue
+            result.images_sent += 1
+
+        result.cases_sent = result.images_sent
+        stats.sent_telegram_images += result.images_sent
+        return result
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 def process_pdf_and_send(
     pdf_path: Path, config: Config, state: StateStore, tmp_root: Path, stats: IngestStats
 ) -> PdfRunResult:
     """실제 Telegram/Notion 반영까지 수행하고, 사용자 알림에 필요한 결과를 돌려준다."""
+    if config.simple_pdf_bundle_only:
+        return _send_pdf_as_simple_bundles(pdf_path, config, tmp_root, stats)
+
     result = PdfRunResult()
     work_dir = tmp_root / f"work_{hash_file(pdf_path)[:12]}"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -849,29 +906,21 @@ def _handle_update(
         return
     stats.pdf_documents_seen += 1
 
-    update_id = update.get("update_id")
     message_id = message.get("message_id")
 
-    if update_id is not None and state.has_processed_update(update_id):
-        stats.duplicate_messages_skipped += 1
-        telegram.send_message(chat_id, DUPLICATE_MSG)
-        stats.user_notifications_sent += 1
-        return
     if message_id is not None and state.has_processed_message(chat_id, message_id):
         stats.duplicate_messages_skipped += 1
         telegram.send_message(chat_id, DUPLICATE_MSG)
         stats.user_notifications_sent += 1
         return
 
-    if update_id is not None:
-        state.mark_update_processed(update_id)
     if message_id is not None:
         state.mark_message_processed(chat_id, message_id)
 
     file_id = document["file_id"]
     file_size = document.get("file_size") or 0
     if file_size and file_size > MAX_PDF_BYTES:
-        telegram.send_message(chat_id, DOWNLOAD_FAIL_MSG)
+        telegram.send_message(chat_id, f"PDF 처리 실패: {document.get('file_name', 'unknown.pdf')}")
         stats.user_notifications_sent += 1
         stats.errors_count += 1
         return
@@ -882,36 +931,18 @@ def _handle_update(
         telegram.download_file(file_info["file_path"], pdf_path)
     except Exception:
         logger.exception("pdf download failed")
-        telegram.send_message(chat_id, DOWNLOAD_FAIL_MSG)
+        telegram.send_message(chat_id, f"PDF 처리 실패: {document.get('file_name', 'unknown.pdf')}")
         stats.user_notifications_sent += 1
         stats.errors_count += 1
         return
     stats.downloaded_pdfs += 1
 
+    file_name = document.get("file_name", "")
     try:
-        pdf_hash = hash_file(pdf_path)
-        if state.has_processed_pdf(pdf_hash):
-            logger.info(
-                "reprocessing requested: same pdf hash with new telegram message "
-                "(chat_id=%s, message_id=%s, hash=%s)",
-                chat_id,
-                message_id,
-                pdf_hash,
-            )
-
-        run_result = process_pdf_and_send(pdf_path, config, state, tmp_root, stats)
-        # PDF hash는 참고용 로그/이력으로만 저장한다 (재처리 차단 기준으로 사용하지 않음).
-        if run_result.cases_sent > 0:
-            state.mark_pdf_processed(pdf_hash, {"file_name": document.get("file_name", "")})
-        else:
-            logger.info("pdf hash history not saved (no case successfully sent)")
-
-        for note in build_result_notifications(run_result):
-            telegram.send_message(chat_id, note)
-            stats.user_notifications_sent += 1
+        process_pdf_and_send(pdf_path, config, state, tmp_root, stats)
     except Exception:
         logger.exception("pdf processing failed")
-        telegram.send_message(chat_id, GENERIC_FAIL_MSG)
+        telegram.send_message(chat_id, f"PDF 처리 실패: {file_name or 'unknown.pdf'}")
         stats.user_notifications_sent += 1
         stats.errors_count += 1
     finally:

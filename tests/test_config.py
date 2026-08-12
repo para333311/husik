@@ -14,6 +14,7 @@ def _clear_husik_env(monkeypatch):
         "NAVER_CLIENT_SECRET",
         "NOTION_AUCTION_DB_URL",
         "NOTION_HUSIK_DB_ID",
+        "SIMPLE_PDF_BUNDLE_ONLY",
     ]:
         monkeypatch.delenv(name, raising=False)
 
@@ -88,6 +89,7 @@ def test_openai_vision_disabled_by_default(monkeypatch):
 
     assert config.openai_api_key == "x"
     assert config.openai_vision_enabled is False
+    assert config.simple_pdf_bundle_only is True
 
 
 def test_openai_vision_enabled_only_when_env_true(monkeypatch):
@@ -100,3 +102,16 @@ def test_openai_vision_enabled_only_when_env_true(monkeypatch):
     config = Config.from_env()
 
     assert config.openai_vision_enabled is True
+
+
+def test_simple_pdf_bundle_only_can_be_disabled_from_env(monkeypatch):
+    from husik.config import Config
+
+    _clear_husik_env(monkeypatch)
+    _set_all_required(monkeypatch)
+    monkeypatch.setenv("NOTION_AUCTION_DB_URL", "db-url")
+    monkeypatch.setenv("SIMPLE_PDF_BUNDLE_ONLY", "false")
+
+    config = Config.from_env()
+
+    assert config.simple_pdf_bundle_only is False
